@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 10;
+const SCHEMA_VERSION: u32 = 11;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -49,6 +49,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 10 {
         migrate_v10(conn)?;
+    }
+
+    if current_version < 11 {
+        migrate_v11(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -377,6 +381,20 @@ fn migrate_v10(conn: &Connection) -> Result<(), rusqlite::Error> {
     }
     conn.execute(
         "INSERT OR IGNORE INTO migrations (version, applied_at, description) VALUES (10, datetime('now'), 'Add locked and personality_category to memories')",
+        [],
+    )?;
+    Ok(())
+}
+
+fn migrate_v11(conn: &Connection) -> Result<(), rusqlite::Error> {
+    if !column_exists(conn, "memories", "updated_at") {
+        conn.execute(
+            "ALTER TABLE memories ADD COLUMN updated_at TEXT NOT NULL DEFAULT '2024-01-01T00:00:00Z'",
+            [],
+        )?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO migrations (version, applied_at, description) VALUES (11, datetime('now'), 'Add updated_at to memories')",
         [],
     )?;
     Ok(())

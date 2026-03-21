@@ -35,7 +35,7 @@ pub use openfang_types::driver::embedding::{EmbeddingDriver, EmbeddingError};
 use async_trait::async_trait;
 use openfang_types::model_catalog::{
     FIREWORKS_BASE_URL, GROQ_BASE_URL, LMSTUDIO_BASE_URL, MISTRAL_BASE_URL, OLLAMA_BASE_URL,
-    OPENAI_BASE_URL, TOGETHER_BASE_URL, VLLM_BASE_URL,
+    OPENAI_BASE_URL, OPENROUTER_BASE_URL, TOGETHER_BASE_URL, VLLM_BASE_URL,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -222,6 +222,7 @@ pub fn create_embedding_driver(
                     | "ollama"
                     | "vllm"
                     | "lmstudio"
+                    | "openrouter"
             );
             if needs_v1 && !trimmed.ends_with("/v1") {
                 format!("{trimmed}/v1")
@@ -238,6 +239,7 @@ pub fn create_embedding_driver(
             "ollama" => OLLAMA_BASE_URL.to_string(),
             "vllm" => VLLM_BASE_URL.to_string(),
             "lmstudio" => LMSTUDIO_BASE_URL.to_string(),
+            "openrouter" => OPENROUTER_BASE_URL.to_string(),
             other => {
                 warn!("Unknown embedding provider '{other}', using OpenAI-compatible format");
                 format!("https://{other}/v1")

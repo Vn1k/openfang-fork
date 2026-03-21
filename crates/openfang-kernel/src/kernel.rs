@@ -2091,6 +2091,7 @@ impl OpenFangKernel {
                 ctx_window,
                 Some(&kernel_clone.process_manager),
                 content_blocks,
+                kernel_clone.config.memory.smart_memory_enabled,
             )
             .await;
 
@@ -2720,6 +2721,7 @@ impl OpenFangKernel {
             ctx_window,
             Some(&self.process_manager),
             content_blocks,
+            self.config.memory.smart_memory_enabled,
         )
         .await
         .map_err(KernelError::OpenFang)?;

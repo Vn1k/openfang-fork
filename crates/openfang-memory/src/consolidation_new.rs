@@ -104,6 +104,7 @@ pub async fn consolidate_memories(
 
     let filter = MemoryFilter {
         agent_id: Some(agent_id),
+        scope: Some("semantic".to_string()),
         ..Default::default()
     };
 

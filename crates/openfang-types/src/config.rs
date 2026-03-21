@@ -1534,6 +1534,48 @@ pub struct MemoryConfig {
     /// If not configured, falls back to the agent's own LLM.
     #[serde(default)]
     pub memory_decision_llm: MemoryLlmConfig,
+
+    /// Personality configuration for emergent personality through memory.
+    #[serde(default)]
+    pub personality: PersonalityConfig,
+}
+
+/// Configuration for emergent personality through memory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PersonalityConfig {
+    /// LLM for extracting personality memories.
+    /// If not configured, falls back to the agent's own LLM.
+    pub personality_llm: MemoryLlmConfig,
+    /// Extract personality every N conversations (0 = disabled).
+    #[serde(default = "default_personality_extraction_interval")]
+    pub extraction_interval: usize,
+    /// Patterns to detect explicit user preferences.
+    #[serde(default)]
+    pub preference_trigger_patterns: Vec<String>,
+}
+
+fn default_personality_extraction_interval() -> usize {
+    5
+}
+
+impl Default for PersonalityConfig {
+    fn default() -> Self {
+        Self {
+            personality_llm: MemoryLlmConfig::default(),
+            extraction_interval: 5,
+            preference_trigger_patterns: vec![
+                "be more".to_string(),
+                "i prefer you".to_string(),
+                "don't be".to_string(),
+                "i like when you".to_string(),
+                "i don't like when you".to_string(),
+                "can you be".to_string(),
+                "try to be".to_string(),
+                "i wish you were".to_string(),
+            ],
+        }
+    }
 }
 
 fn default_consolidation_interval() -> u64 {
@@ -1554,6 +1596,7 @@ impl Default for MemoryConfig {
             smart_memory_interval: 3,
             fact_extraction_llm: MemoryLlmConfig::default(),
             memory_decision_llm: MemoryLlmConfig::default(),
+            personality: PersonalityConfig::default(),
         }
     }
 }

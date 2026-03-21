@@ -223,6 +223,15 @@ pub async fn build_router(
             axum::routing::post(routes::clone_agent),
         )
         .route(
+            "/api/agents/{id}/personality",
+            axum::routing::get(routes::list_personality_memories),
+        )
+        .route(
+            "/api/agents/{id}/personality/{memory_id}",
+            axum::routing::put(routes::update_personality_memory)
+                .delete(routes::delete_personality_memory),
+        )
+        .route(
             "/api/agents/{id}/files",
             axum::routing::get(routes::list_agent_files),
         )

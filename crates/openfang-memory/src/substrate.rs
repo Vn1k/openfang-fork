@@ -346,9 +346,11 @@ impl MemorySubstrate {
         scope: &str,
         metadata: HashMap<String, serde_json::Value>,
         embedding: Option<&[f32]>,
+        locked: bool,
+        personality_category: Option<&str>,
     ) -> OpenFangResult<MemoryId> {
         self.semantic
-            .remember_with_embedding(agent_id, content, source, scope, metadata, embedding)
+            .remember_with_embedding(agent_id, content, source, scope, metadata, embedding, locked, personality_category)
     }
 
     /// Recall memories using vector similarity when a query embedding is provided.
@@ -395,11 +397,14 @@ impl MemorySubstrate {
         scope: &str,
         metadata: HashMap<String, serde_json::Value>,
         embedding: Option<&[f32]>,
+        locked: bool,
+        personality_category: Option<&str>,
     ) -> OpenFangResult<MemoryId> {
         let store = self.semantic.clone();
         let content = content.to_string();
         let scope = scope.to_string();
         let embedding_owned = embedding.map(|e| e.to_vec());
+        let personality_cat = personality_category.map(|s| s.to_string());
         tokio::task::spawn_blocking(move || {
             store.remember_with_embedding(
                 agent_id,
@@ -408,6 +413,8 @@ impl MemorySubstrate {
                 &scope,
                 metadata,
                 embedding_owned.as_deref(),
+                locked,
+                personality_cat.as_deref(),
             )
         })
         .await

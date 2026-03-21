@@ -46,6 +46,18 @@ pub enum MemorySource {
     UserProvided,
     /// From a system event.
     System,
+    /// Personality memory (self, relationship, user preferences).
+    Personality,
+}
+
+/// Category for personality memories.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersonalityCategory {
+    #[default]
+    Self_,
+    Relationship,
+    UserPreference,
 }
 
 /// A single unit of memory stored in the semantic store.
@@ -73,6 +85,12 @@ pub struct MemoryFragment {
     pub access_count: u64,
     /// Memory scope/collection name.
     pub scope: String,
+    /// Whether this personality memory is locked (cannot be deleted).
+    #[serde(default)]
+    pub locked: bool,
+    /// Category for personality memories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub personality_category: Option<PersonalityCategory>,
 }
 
 /// Filter criteria for memory recall.
@@ -92,6 +110,8 @@ pub struct MemoryFilter {
     pub before: Option<DateTime<Utc>>,
     /// Metadata key-value filters.
     pub metadata: HashMap<String, serde_json::Value>,
+    /// Filter by personality category.
+    pub personality_category: Option<PersonalityCategory>,
 }
 
 impl MemoryFilter {
@@ -360,6 +380,8 @@ mod tests {
             accessed_at: Utc::now(),
             access_count: 0,
             scope: "episodic".to_string(),
+            locked: false,
+            personality_category: None,
         };
         let json = serde_json::to_string(&fragment).unwrap();
         let deserialized: MemoryFragment = serde_json::from_str(&json).unwrap();

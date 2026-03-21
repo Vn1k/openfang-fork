@@ -18,6 +18,7 @@ pub mod extraction;
 pub mod consolidation_new;
 pub mod smart_memory;
 pub mod prompt;
+pub mod personality;
 
 mod substrate;
 pub use substrate::MemorySubstrate;

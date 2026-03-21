@@ -29,10 +29,10 @@ use openfang_runtime::sandbox::{SandboxConfig, WasmSandbox};
 use openfang_runtime::tool_runner::builtin_tool_definitions;
 use openfang_types::agent::*;
 use openfang_types::capability::Capability;
-use openfang_types::config::{KernelConfig, OutputFormat};
+use openfang_types::config::{KernelConfig, OutputFormat, PersonalityConfig};
 use openfang_types::error::OpenFangError;
 use openfang_types::event::*;
-use openfang_types::memory::Memory;
+use openfang_types::memory::{Memory, PersonalityCategory};
 use openfang_types::tool::ToolDefinition;
 
 use async_trait::async_trait;
@@ -425,6 +425,111 @@ fn generate_identity_files(workspace: &Path, manifest: &AgentManifest) {
             }
         }
     }
+}
+
+/// Emergent personality extraction — background task.
+///
+/// Runs personality memory extraction after agent conversation.
+/// Checks both periodic trigger (every N conversations) and explicit preference detection.
+async fn run_personality_extraction(
+    agent_id: AgentId,
+    session_id: SessionId,
+    memory: &Arc<MemorySubstrate>,
+    llm_driver: Arc<dyn LlmDriver>,
+    model: &str,
+    personality_config: &PersonalityConfig,
+) -> KernelResult<()> {
+    use openfang_memory::personality::{detect_preference, extract_personality, should_extract_periodic, ExtractionTrigger};
+    use openfang_types::memory::MemorySource;
+    use openfang_types::message::Role;
+
+    let session = memory.get_session(session_id).map_err(KernelError::OpenFang)?;
+    let messages = match session {
+        Some(s) => s.messages,
+        None => return Ok(()),
+    };
+
+    if messages.is_empty() {
+        return Ok(());
+    }
+
+    let conversation_count = messages.len() / 2;
+
+    let trigger = if personality_config.extraction_interval > 0
+        && should_extract_periodic(conversation_count, personality_config.extraction_interval)
+    {
+        Some(ExtractionTrigger::Periodic)
+    } else {
+        let last_user_msg = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .map(|m| m.content.text_content().to_string());
+
+        if let Some(msg) = last_user_msg {
+            if !personality_config.preference_trigger_patterns.is_empty() {
+                match detect_preference(
+                    &msg,
+                    &personality_config.preference_trigger_patterns,
+                    llm_driver.as_ref(),
+                    model,
+                ).await {
+                    Ok(Some((t, _))) => Some(t),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    let trigger = match trigger {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+
+    let extraction_trigger_str = match trigger {
+        ExtractionTrigger::Periodic => "periodic",
+        ExtractionTrigger::ExplicitPreference => "explicit_preference",
+        ExtractionTrigger::ImplicitPreference => "implicit_preference",
+    };
+
+    let extracted = extract_personality(&messages, trigger.clone(), llm_driver.as_ref(), model)
+        .await
+        .map_err(|e| KernelError::OpenFang(e))?;
+
+    if extracted.is_empty() {
+        return Ok(());
+    }
+
+    for fact in extracted {
+        let category_str = match fact.category {
+            PersonalityCategory::Self_ => "self",
+            PersonalityCategory::Relationship => "relationship",
+            PersonalityCategory::UserPreference => "user_preference",
+        };
+
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("extraction_trigger".to_string(), serde_json::json!(extraction_trigger_str));
+        metadata.insert("category".to_string(), serde_json::json!(category_str));
+
+        let _ = memory
+            .remember_with_embedding_async(
+                agent_id,
+                &fact.content,
+                MemorySource::Personality,
+                "personality",
+                metadata,
+                None,
+                fact.locked,
+                Some(category_str),
+            )
+            .await;
+    }
+
+    Ok(())
 }
 
 /// Append an assistant response summary to the daily memory log (best-effort, append-only).
@@ -2724,6 +2829,45 @@ impl OpenFangKernel {
                 ),
             }
             } // end should_run_smart
+        }
+
+        // Emergent personality extraction
+        let personality_config = &self.config.memory.personality;
+        if personality_config.extraction_interval > 0 || !personality_config.preference_trigger_patterns.is_empty() {
+            let agent_id_for_extraction = agent_id;
+            let mem_for_extraction = Arc::clone(&self.memory);
+            let personality_cfg = personality_config.clone();
+            let session_id = entry.session_id;
+            let manifest = manifest.clone();
+
+            let extract_result = match self.resolve_driver(&manifest) {
+                Ok(agent_driver) => {
+                    let memory_config = &self.config.memory;
+                    self.resolve_memory_llm_driver(
+                        &memory_config.personality.personality_llm,
+                        &manifest,
+                        agent_driver,
+                    )
+                }
+                Err(e) => Err(e),
+            };
+
+            if let Ok((personality_driver, personality_model)) = extract_result {
+                tokio::spawn(async move {
+                    if let Err(e) = run_personality_extraction(
+                        agent_id_for_extraction,
+                        session_id,
+                        &mem_for_extraction,
+                        personality_driver,
+                        &personality_model,
+                        &personality_cfg,
+                    ).await {
+                        warn!(agent_id = %agent_id_for_extraction, "Personality extraction failed: {e}");
+                    }
+                });
+            } else if let Err(e) = extract_result {
+                warn!(agent_id = %agent_id, "Personality LLM driver resolve failed: {e}");
+            }
         }
 
         // Populate cost on the result based on usage_footer mode

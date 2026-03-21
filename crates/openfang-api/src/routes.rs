@@ -14,6 +14,7 @@ use openfang_kernel::OpenFangKernel;
 use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::tool_runner::builtin_tool_definitions;
 use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest};
+use openfang_types::memory::{Memory, MemoryFilter, MemoryId, PersonalityCategory};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
@@ -11328,6 +11329,266 @@ fn remove_toml_section(content: &str, section: &str) -> String {
         }
     }
     result
+}
+
+// ---------------------------------------------------------------------------
+// Personality memory routes
+// ---------------------------------------------------------------------------
+
+/// GET /api/agents/{id}/personality — List personality memories for an agent.
+/// Optional query param: ?category=self|relationship|user_preference
+pub async fn list_personality_memories(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            );
+        }
+    };
+
+    if state.kernel.registry.get(agent_id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Agent not found"})),
+        );
+    }
+
+    let category_filter = params.get("category").and_then(|c| match c.as_str() {
+        "self" => Some(PersonalityCategory::Self_),
+        "relationship" => Some(PersonalityCategory::Relationship),
+        "user_preference" => Some(PersonalityCategory::UserPreference),
+        _ => None,
+    });
+
+    let filter = MemoryFilter {
+        agent_id: Some(agent_id),
+        personality_category: category_filter,
+        ..Default::default()
+    };
+
+    match state
+        .kernel
+        .memory
+        .recall("", 100, Some(filter))
+        .await
+    {
+        Ok(fragments) => {
+            let memories: Vec<serde_json::Value> = fragments
+                .into_iter()
+                .map(|f| serde_json::json!({
+                    "id": f.id.0.to_string(),
+                    "content": f.content,
+                    "category": f.personality_category,
+                    "locked": f.locked,
+                    "confidence": f.confidence,
+                    "access_count": f.access_count,
+                    "created_at": f.created_at.to_rfc3339(),
+                    "accessed_at": f.accessed_at.to_rfc3339(),
+                }))
+                .collect();
+            (StatusCode::OK, Json(serde_json::json!({"personality_memories": memories})))
+        }
+        Err(e) => {
+            tracing::warn!("list_personality_memories failed for agent {id}: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Failed to retrieve personality memories"})),
+            )
+        }
+    }
+}
+
+/// Request body for updating a personality memory.
+#[derive(serde::Deserialize)]
+pub struct UpdatePersonalityMemoryRequest {
+    pub content: String,
+}
+
+/// PUT /api/agents/{id}/personality/{memory_id} — Update a personality memory content.
+/// Locked memories cannot be updated.
+pub async fn update_personality_memory(
+    State(state): State<Arc<AppState>>,
+    Path((id, memory_id)): Path<(String, String)>,
+    Json(req): Json<UpdatePersonalityMemoryRequest>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            );
+        }
+    };
+
+    if state.kernel.registry.get(agent_id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Agent not found"})),
+        );
+    }
+
+    let mem_id = match uuid::Uuid::parse_str(&memory_id) {
+        Ok(id) => MemoryId(id),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid memory ID"})),
+            );
+        }
+    };
+
+    let filter = MemoryFilter {
+        agent_id: Some(agent_id),
+        ..Default::default()
+    };
+
+    let fragments = match state
+        .kernel
+        .memory
+        .recall("", 1000, Some(filter))
+        .await
+    {
+        Ok(frags) => frags,
+        Err(e) => {
+            tracing::warn!("update_personality_memory: recall failed: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Failed to check memory"})),
+            );
+        }
+    };
+
+    let memory = fragments.into_iter().find(|f| f.id == mem_id);
+
+    match memory {
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Memory not found"})),
+        ),
+        Some(f) if f.locked => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "Cannot update a locked memory"})),
+        ),
+        Some(_) => {
+            let mem_ref = state.kernel.memory.clone();
+            let content = req.content;
+            let result = tokio::task::spawn_blocking(move || {
+                mem_ref.update_memory_content(mem_id, &content)
+            })
+            .await;
+
+            match result {
+                Ok(Ok(())) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({"status": "updated", "memory_id": memory_id})),
+                ),
+                Ok(Err(e)) => {
+                    tracing::warn!("update_personality_memory failed: {e}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": "Failed to update memory"})),
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!("update_personality_memory spawn failed: {e}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": "Failed to update memory"})),
+                    )
+                }
+            }
+        }
+    }
+}
+
+/// DELETE /api/agents/{id}/personality/{memory_id} — Delete a personality memory.
+/// Locked memories cannot be deleted.
+pub async fn delete_personality_memory(
+    State(state): State<Arc<AppState>>,
+    Path((id, memory_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            );
+        }
+    };
+
+    if state.kernel.registry.get(agent_id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Agent not found"})),
+        );
+    }
+
+    let mem_id = match uuid::Uuid::parse_str(&memory_id) {
+        Ok(id) => MemoryId(id),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid memory ID"})),
+            );
+        }
+    };
+
+    let filter = MemoryFilter {
+        agent_id: Some(agent_id),
+        ..Default::default()
+    };
+
+    let fragments = match state
+        .kernel
+        .memory
+        .recall("", 1000, Some(filter))
+        .await
+    {
+        Ok(frags) => frags,
+        Err(e) => {
+            tracing::warn!("delete_personality_memory: recall failed: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Failed to check memory"})),
+            );
+        }
+    };
+
+    let memory = fragments.into_iter().find(|f| f.id == mem_id);
+
+    match memory {
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Memory not found"})),
+        ),
+        Some(f) if f.locked => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "Cannot delete a locked memory"})),
+        ),
+        Some(_) => {
+            match state.kernel.memory.forget(mem_id).await {
+                Ok(()) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({"status": "deleted", "memory_id": memory_id})),
+                ),
+                Err(e) => {
+                    tracing::warn!("delete_personality_memory failed: {e}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": "Failed to delete memory"})),
+                    )
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

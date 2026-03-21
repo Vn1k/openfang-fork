@@ -540,6 +540,8 @@ pub async fn run_agent_loop(
                                     "episodic",
                                     HashMap::new(),
                                     Some(&vec),
+                                    false,
+                                    None,
                                 )
                                 .await;
                         }
@@ -1543,6 +1545,8 @@ pub async fn run_agent_loop_streaming(
                                     "episodic",
                                     HashMap::new(),
                                     Some(&vec),
+                                    false,
+                                    None,
                                 )
                                 .await;
                         }

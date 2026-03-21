@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 10;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -45,6 +45,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 9 {
         migrate_v9(conn)?;
+    }
+
+    if current_version < 10 {
+        migrate_v10(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -353,6 +357,27 @@ fn migrate_v9(conn: &Connection) -> Result<(), rusqlite::Error> {
         INSERT OR IGNORE INTO migrations (version, applied_at, description)
         VALUES (9, datetime('now'), 'Add memory_history table for mem0-style change tracking');
         ",
+    )?;
+    Ok(())
+}
+
+/// Version 10: Add locked and personality_category columns to memories table.
+fn migrate_v10(conn: &Connection) -> Result<(), rusqlite::Error> {
+    if !column_exists(conn, "memories", "locked") {
+        conn.execute(
+            "ALTER TABLE memories ADD COLUMN locked INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "memories", "personality_category") {
+        conn.execute(
+            "ALTER TABLE memories ADD COLUMN personality_category TEXT",
+            [],
+        )?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO migrations (version, applied_at, description) VALUES (10, datetime('now'), 'Add locked and personality_category to memories')",
+        [],
     )?;
     Ok(())
 }

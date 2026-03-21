@@ -37,7 +37,9 @@ impl SemanticStore {
         scope: &str,
         metadata: HashMap<String, serde_json::Value>,
     ) -> OpenFangResult<MemoryId> {
-        self.remember_with_embedding(agent_id, content, source, scope, metadata, None)
+        self.remember_with_embedding(
+            agent_id, content, source, scope, metadata, None, false, None,
+        )
     }
 
     /// Store a new memory fragment with an optional embedding vector.
@@ -49,6 +51,8 @@ impl SemanticStore {
         scope: &str,
         metadata: HashMap<String, serde_json::Value>,
         embedding: Option<&[f32]>,
+        locked: bool,
+        personality_category: Option<&str>,
     ) -> OpenFangResult<MemoryId> {
         let conn = self
             .conn
@@ -61,10 +65,11 @@ impl SemanticStore {
         let meta_str = serde_json::to_string(&metadata)
             .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
         let embedding_bytes: Option<Vec<u8>> = embedding.map(embedding_to_bytes);
+        let personality_cat_str = personality_category.map(|s| s.to_string());
 
         conn.execute(
-            "INSERT INTO memories (id, agent_id, content, source, scope, confidence, metadata, created_at, accessed_at, access_count, deleted, embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1.0, ?6, ?7, ?7, 0, 0, ?8)",
+            "INSERT INTO memories (id, agent_id, content, source, scope, confidence, metadata, created_at, accessed_at, access_count, deleted, embedding, locked, personality_category)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1.0, ?6, ?7, ?7, 0, 0, ?8, ?9, ?10)",
             rusqlite::params![
                 id.0.to_string(),
                 agent_id.0.to_string(),
@@ -74,6 +79,8 @@ impl SemanticStore {
                 meta_str,
                 now,
                 embedding_bytes,
+                locked as i32,
+                personality_cat_str,
             ],
         )
         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -113,7 +120,7 @@ impl SemanticStore {
         };
 
         let mut sql = String::from(
-            "SELECT id, agent_id, content, source, scope, confidence, metadata, created_at, accessed_at, access_count, embedding
+            "SELECT id, agent_id, content, source, scope, confidence, metadata, created_at, accessed_at, access_count, embedding, locked, personality_category
              FROM memories WHERE deleted = 0",
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -150,6 +157,13 @@ impl SemanticStore {
                 params.push(Box::new(source_str));
                 let _ = param_idx;
             }
+            if let Some(ref personality_cat) = f.personality_category {
+                sql.push_str(&format!(" AND personality_category = ?{param_idx}"));
+                let cat_str = serde_json::to_string(personality_cat)
+                    .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
+                params.push(Box::new(cat_str));
+                let _ = param_idx;
+            }
         }
 
         sql.push_str(" ORDER BY accessed_at DESC, access_count DESC");
@@ -174,6 +188,8 @@ impl SemanticStore {
                 let accessed_str: String = row.get(8)?;
                 let access_count: i64 = row.get(9)?;
                 let embedding_bytes: Option<Vec<u8>> = row.get(10)?;
+                let locked: i32 = row.get(11)?;
+                let personality_category: Option<String> = row.get(12)?;
                 Ok((
                     id_str,
                     agent_str,
@@ -186,6 +202,8 @@ impl SemanticStore {
                     accessed_str,
                     access_count,
                     embedding_bytes,
+                    locked != 0,
+                    personality_category,
                 ))
             })
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -204,6 +222,8 @@ impl SemanticStore {
                 accessed_str,
                 access_count,
                 embedding_bytes,
+                locked,
+                personality_category_str,
             ) = row_result.map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
             let id = uuid::Uuid::parse_str(&id_str)
@@ -224,6 +244,8 @@ impl SemanticStore {
                 .unwrap_or_else(|_| Utc::now());
 
             let embedding = embedding_bytes.as_deref().map(embedding_from_bytes);
+            let personality_category =
+                personality_category_str.map(|s| serde_json::from_str(&s).unwrap_or_default());
 
             fragments.push(MemoryFragment {
                 id,
@@ -237,6 +259,8 @@ impl SemanticStore {
                 accessed_at,
                 access_count: access_count as u64,
                 scope,
+                locked,
+                personality_category,
             });
         }
 
@@ -306,18 +330,21 @@ impl SemanticStore {
     }
 
     pub fn update_memory_content(&self, id: MemoryId, new_content: &str) -> OpenFangResult<()> {
-    let conn = self.conn.lock()
-        .map_err(|e| OpenFangError::Internal(e.to_string()))?;
-    conn.execute(
-        "UPDATE memories SET content = ?1, updated_at = ?2 WHERE id = ?3",
-        rusqlite::params![
-            new_content,
-            chrono::Utc::now().to_rfc3339(),
-            id.0.to_string()
-        ],
-    ).map_err(|e| OpenFangError::Memory(e.to_string()))?;
-    Ok(())
-}
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        conn.execute(
+            "UPDATE memories SET content = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![
+                new_content,
+                chrono::Utc::now().to_rfc3339(),
+                id.0.to_string()
+            ],
+        )
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        Ok(())
+    }
 }
 
 /// Compute cosine similarity between two vectors.
@@ -446,6 +473,8 @@ mod tests {
                 "episodic",
                 HashMap::new(),
                 Some(&embedding),
+                false,
+                None,
             )
             .unwrap();
         assert_ne!(id.0.to_string(), "");
@@ -456,10 +485,9 @@ mod tests {
         let store = setup();
         let agent_id = AgentId::new();
 
-        // Store 3 memories with embeddings pointing in different directions
-        let emb_rust = vec![0.9, 0.1, 0.0, 0.0]; // "Rust" direction
-        let emb_python = vec![0.0, 0.0, 0.9, 0.1]; // "Python" direction
-        let emb_mixed = vec![0.5, 0.5, 0.0, 0.0]; // mixed
+        let emb_rust = vec![0.9, 0.1, 0.0, 0.0];
+        let emb_python = vec![0.0, 0.0, 0.9, 0.1];
+        let emb_mixed = vec![0.5, 0.5, 0.0, 0.0];
 
         store
             .remember_with_embedding(
@@ -469,6 +497,8 @@ mod tests {
                 "episodic",
                 HashMap::new(),
                 Some(&emb_rust),
+                false,
+                None,
             )
             .unwrap();
         store
@@ -479,6 +509,8 @@ mod tests {
                 "episodic",
                 HashMap::new(),
                 Some(&emb_python),
+                false,
+                None,
             )
             .unwrap();
         store
@@ -489,19 +521,18 @@ mod tests {
                 "episodic",
                 HashMap::new(),
                 Some(&emb_mixed),
+                false,
+                None,
             )
             .unwrap();
 
-        // Query with a "Rust"-like embedding
         let query_emb = vec![0.85, 0.15, 0.0, 0.0];
         let results = store
             .recall_with_embedding("", 3, None, Some(&query_emb))
             .unwrap();
 
         assert_eq!(results.len(), 3);
-        // Rust memory should be first (highest cosine similarity)
         assert!(results[0].content.contains("Rust"));
-        // Python memory should be last (lowest similarity)
         assert!(results[2].content.contains("Python"));
     }
 
@@ -547,6 +578,8 @@ mod tests {
                 "episodic",
                 HashMap::new(),
                 Some(&[1.0, 0.0]),
+                false,
+                None,
             )
             .unwrap();
         store

@@ -95,7 +95,6 @@ pub async fn smart_add(
                 let embedding = embed_opt(embedding_driver, &text).await;
 
                 let store_result = if let Some(ref vec) = embedding {
-                    // remember_with_embedding is a plain (sync) method on MemorySubstrate
                     memory.remember_with_embedding(
                         agent_id,
                         &text,
@@ -103,6 +102,8 @@ pub async fn smart_add(
                         "semantic",
                         HashMap::new(),
                         Some(vec),
+                        false,
+                        None,
                     )
                 } else {
                     // remember() is an async method from the Memory trait

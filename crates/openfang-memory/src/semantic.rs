@@ -304,6 +304,20 @@ impl SemanticStore {
         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         Ok(())
     }
+
+    pub fn update_memory_content(&self, id: MemoryId, new_content: &str) -> OpenFangResult<()> {
+    let conn = self.conn.lock()
+        .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+    conn.execute(
+        "UPDATE memories SET content = ?1, updated_at = ?2 WHERE id = ?3",
+        rusqlite::params![
+            new_content,
+            chrono::Utc::now().to_rfc3339(),
+            id.0.to_string()
+        ],
+    ).map_err(|e| OpenFangError::Memory(e.to_string()))?;
+    Ok(())
+}
 }
 
 /// Compute cosine similarity between two vectors.

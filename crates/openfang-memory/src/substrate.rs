@@ -414,6 +414,62 @@ impl MemorySubstrate {
         .map_err(|e| OpenFangError::Internal(e.to_string()))?
     }
 
+    pub fn update_memory_content(&self, id: MemoryId, new_content: &str) -> OpenFangResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let rows = conn
+            .execute(
+                "UPDATE memories SET content = ?1, updated_at = ?2 WHERE id = ?3 AND deleted = 0",
+                rusqlite::params![
+                    new_content,
+                    chrono::Utc::now().to_rfc3339(),
+                    id.0.to_string(),
+                ],
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        if rows == 0 {
+            return Err(OpenFangError::Memory(format!(
+                "Memory not found or already deleted: {}",
+                id.0
+            )));
+        }
+        Ok(())
+    }
+
+    /// Append a row to the `memory_history` audit table.
+    ///
+    /// | event    | old_memory | new_memory |
+    /// |----------|------------|------------|
+    /// | `"ADD"`  | `None`     | `Some(…)`  |
+    /// | `"UPDATE"`| `Some(…)` | `Some(…)`  |
+    /// | `"DELETE"`| `Some(…)` | `None`     |
+    ///
+    /// Failures are non-fatal — callers log and continue.
+    pub fn add_memory_history(
+        &self,
+        memory_id: &str,
+        old_memory: Option<&str>,
+        new_memory: Option<&str>,
+        event: &str,
+    ) -> OpenFangResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO memory_history (id, memory_id, old_memory, new_memory, event, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![id, memory_id, old_memory, new_memory, event, now],
+        )
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        Ok(())
+    }
+
     // -----------------------------------------------------------------
     // Task queue operations
     // -----------------------------------------------------------------

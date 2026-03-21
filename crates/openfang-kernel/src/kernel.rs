@@ -2045,6 +2045,69 @@ impl OpenFangKernel {
                         .registry
                         .set_state(agent_id, AgentState::Running);
 
+                    // mem0-style smart memory update (non-blocking background task)
+                    if kernel_clone.config.memory.smart_memory_enabled {
+                        // smart_memory_interval: 0 = every turn, N = every N turns
+                        let sm_interval = kernel_clone.config.memory.smart_memory_interval;
+                        let turn_count = session.messages.len();
+                        let should_run_smart = sm_interval == 0
+                            || turn_count % sm_interval.max(1) == 0;
+
+                        if should_run_smart {
+                        match kernel_clone.resolve_driver(&manifest) {
+                            Ok(driver_clone) => {
+                                let mem_clone = Arc::clone(&kernel_clone.memory);
+                                let emb_clone = kernel_clone.embedding_driver.clone();
+                                // Use smart_memory_model if configured, else fall back to
+                                // the agent's own model.
+                                let model = kernel_clone
+                                    .config
+                                    .memory
+                                    .smart_memory_model
+                                    .clone()
+                                    .unwrap_or_else(|| manifest.model.model.clone());
+                                let has_assistant = session
+                                    .messages
+                                    .iter()
+                                    .any(|m| m.role == openfang_types::message::Role::Assistant);
+                                let new_msgs: Vec<_> = session.messages[messages_before..].to_vec();
+                                let agent_id_for_smart = agent_id;
+
+                                tokio::spawn(async move {
+                                    match openfang_memory::smart_memory::smart_add(
+                                        agent_id_for_smart,
+                                        &new_msgs,
+                                        &mem_clone,
+                                        driver_clone.as_ref(),
+                                        emb_clone.as_deref(),
+                                        &model,
+                                        has_assistant,
+                                    )
+                                    .await
+                                    {
+                                        Ok(r) => info!(
+                                            agent_id = %agent_id_for_smart,
+                                            added = r.added,
+                                            updated = r.updated,
+                                            deleted = r.deleted,
+                                            facts = r.facts_extracted,
+                                            "Smart memory update complete"
+                                        ),
+                                        Err(e) => warn!(
+                                            agent_id = %agent_id_for_smart,
+                                            "Smart memory update failed: {e}"
+                                        ),
+                                    }
+                                });
+                            }
+                            Err(e) => warn!(
+                                agent_id = %agent_id,
+                                "Smart memory driver resolve failed: {e}"
+                            ),
+                        }
+                        } // end should_run_smart
+                    }
+
                     // Post-loop compaction check: if session now exceeds token threshold,
                     // trigger compaction in background for the next call.
                     {
@@ -2581,6 +2644,65 @@ impl OpenFangKernel {
             cost_usd: cost,
             tool_calls: result.iterations.saturating_sub(1),
         });
+
+        // mem0-style smart memory update (non-blocking background task)
+        if self.config.memory.smart_memory_enabled {
+            // smart_memory_interval: 0 = every turn, N = every N turns
+            let sm_interval = self.config.memory.smart_memory_interval;
+            let turn_count = session.messages.len();
+            let should_run_smart = sm_interval == 0
+                || turn_count % sm_interval.max(1) == 0;
+
+            if should_run_smart {
+            match self.resolve_driver(&manifest) {
+                Ok(driver_clone) => {
+                    let mem_clone = Arc::clone(&self.memory);
+                    let emb_clone = self.embedding_driver.clone();
+                    // Use smart_memory_model if configured, else fall back to
+                    // the agent's own model.
+                    let model = self
+                        .config
+                        .memory
+                        .smart_memory_model
+                        .clone()
+                        .unwrap_or_else(|| manifest.model.model.clone());
+                    let has_assistant = session
+                        .messages
+                        .iter()
+                        .any(|m| m.role == openfang_types::message::Role::Assistant);
+                    let new_msgs: Vec<_> = session.messages[messages_before..].to_vec();
+
+                    tokio::spawn(async move {
+                        match openfang_memory::smart_memory::smart_add(
+                            agent_id,
+                            &new_msgs,
+                            &mem_clone,
+                            driver_clone.as_ref(),
+                            emb_clone.as_deref(),
+                            &model,
+                            has_assistant,
+                        )
+                        .await
+                        {
+                            Ok(r) => info!(
+                                agent_id = %agent_id,
+                                added = r.added,
+                                updated = r.updated,
+                                deleted = r.deleted,
+                                facts = r.facts_extracted,
+                                "Smart memory update complete"
+                            ),
+                            Err(e) => warn!(agent_id = %agent_id, "Smart memory update failed: {e}"),
+                        }
+                    });
+                }
+                Err(e) => warn!(
+                    agent_id = %agent_id,
+                    "Smart memory driver resolve failed: {e}"
+                ),
+            }
+            } // end should_run_smart
+        }
 
         // Populate cost on the result based on usage_footer mode
         let mut result = result;

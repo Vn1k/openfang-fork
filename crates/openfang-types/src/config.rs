@@ -1488,6 +1488,24 @@ pub struct MemoryConfig {
     /// How often to run memory consolidation (hours). 0 = disabled.
     #[serde(default = "default_consolidation_interval")]
     pub consolidation_interval_hours: u64,
+
+    /// Enable mem0-style LLM fact extraction and consolidation.
+    /// When true, memories are extracted as discrete facts and
+    /// deduplicated/updated intelligently. Adds ~1-2 LLM calls per turn.
+    #[serde(default)]
+    pub smart_memory_enabled: bool,
+    
+    /// Only run smart memory extraction every N turns (0 = every turn).
+    /// Reduces LLM cost at expense of memory freshness.
+    #[serde(default)]
+    pub smart_memory_interval: usize,
+
+    /// Model to use for smart memory LLM calls (extraction + consolidation).
+    /// If None, uses the agent's own model.
+    /// Recommended: a small, cheap model (e.g. "groq/llama-3.1-8b-instant")
+    /// to keep memory operation costs low.
+    #[serde(default)]
+    pub smart_memory_model: Option<String>,
 }
 
 fn default_consolidation_interval() -> u64 {
@@ -1504,6 +1522,9 @@ impl Default for MemoryConfig {
             embedding_provider: None,
             embedding_api_key_env: None,
             consolidation_interval_hours: default_consolidation_interval(),
+            smart_memory_enabled: false,
+            smart_memory_interval: 3,
+            smart_memory_model: None,
         }
     }
 }

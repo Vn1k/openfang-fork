@@ -1467,6 +1467,31 @@ impl Default for DefaultModelConfig {
     }
 }
 
+/// LLM configuration for memory operations (fact extraction and memory decision).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryLlmConfig {
+    /// Provider name (e.g., "openai", "anthropic", "groq", "ollama").
+    /// If None, falls back to the agent's own LLM.
+    pub provider: Option<String>,
+    /// Model name (e.g., "gpt-4o-mini", "claude-3-haiku-20250514", "llama-3.1-8b-instant").
+    /// If None, falls back to the agent's own model.
+    pub model: Option<String>,
+    /// Environment variable name for the API key.
+    /// If None, uses the provider's default env var (e.g., OPENAI_API_KEY).
+    pub api_key_env: Option<String>,
+}
+
+impl Default for MemoryLlmConfig {
+    fn default() -> Self {
+        Self {
+            provider: None,
+            model: None,
+            api_key_env: None,
+        }
+    }
+}
+
 /// Memory substrate configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1494,18 +1519,21 @@ pub struct MemoryConfig {
     /// deduplicated/updated intelligently. Adds ~1-2 LLM calls per turn.
     #[serde(default)]
     pub smart_memory_enabled: bool,
-    
+
     /// Only run smart memory extraction every N turns (0 = every turn).
     /// Reduces LLM cost at expense of memory freshness.
     #[serde(default)]
     pub smart_memory_interval: usize,
 
-    /// Model to use for smart memory LLM calls (extraction + consolidation).
-    /// If None, uses the agent's own model.
-    /// Recommended: a small, cheap model (e.g. "groq/llama-3.1-8b-instant")
-    /// to keep memory operation costs low.
+    /// LLM for extracting facts from conversation.
+    /// If not configured, falls back to the agent's own LLM.
     #[serde(default)]
-    pub smart_memory_model: Option<String>,
+    pub fact_extraction_llm: MemoryLlmConfig,
+
+    /// LLM for deciding add/replace/delete actions during consolidation.
+    /// If not configured, falls back to the agent's own LLM.
+    #[serde(default)]
+    pub memory_decision_llm: MemoryLlmConfig,
 }
 
 fn default_consolidation_interval() -> u64 {
@@ -1524,7 +1552,8 @@ impl Default for MemoryConfig {
             consolidation_interval_hours: default_consolidation_interval(),
             smart_memory_enabled: false,
             smart_memory_interval: 3,
-            smart_memory_model: None,
+            fact_extraction_llm: MemoryLlmConfig::default(),
+            memory_decision_llm: MemoryLlmConfig::default(),
         }
     }
 }

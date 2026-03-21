@@ -39,17 +39,24 @@ pub struct SmartAddResult {
 /// `embedding_driver` uses `dyn EmbeddingDriver + Send + Sync` to match
 /// what `kernel.rs` provides via `Arc<dyn EmbeddingDriver + Send + Sync>.as_deref()`.
 /// Using just `dyn EmbeddingDriver` would be a type mismatch (E0308).
+///
+/// ## LLM Drivers
+///
+/// `fact_extraction_driver` is used to extract facts from conversation messages.
+/// `memory_decision_driver` is used to decide add/replace/delete actions during consolidation.
 pub async fn smart_add(
     agent_id: AgentId,
     messages: &[Message],
     memory: &MemorySubstrate,
-    llm_driver: &dyn LlmDriver,
+    fact_extraction_driver: &dyn LlmDriver,
+    memory_decision_driver: &dyn LlmDriver,
     embedding_driver: Option<&(dyn EmbeddingDriver + Send + Sync)>,
-    model: &str,
+    fact_extraction_model: &str,
+    memory_decision_model: &str,
     _has_assistant_messages: bool,
 ) -> OpenFangResult<SmartAddResult> {
     // ── Step 1: Extract facts ─────────────────────────────────────────────────
-    let facts = extract_facts(messages, false, llm_driver).await?;
+    let facts = extract_facts(messages, false, fact_extraction_driver, fact_extraction_model).await?;
 
     if facts.is_empty() {
         info!(agent_id = %agent_id, "No facts extracted from messages");
@@ -64,8 +71,8 @@ pub async fn smart_add(
         facts.clone(),
         memory,
         embedding_driver,
-        llm_driver,
-        model,
+        memory_decision_driver,
+        memory_decision_model,
     )
     .await?;
 

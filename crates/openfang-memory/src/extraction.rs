@@ -75,6 +75,7 @@ pub async fn extract_facts(
     messages: &[Message],
     is_agent_memory: bool,
     llm_driver: &dyn LlmDriver,
+    model: &str,
 ) -> OpenFangResult<Vec<ExtractedFact>> {
     use openfang_types::message::{MessageContent, Role};
 
@@ -105,9 +106,7 @@ pub async fn extract_facts(
     });
 
     let request = CompletionRequest {
-        // Model is intentionally left empty here; it is filled by the
-        // smart_memory orchestrator which knows the configured memory model.
-        model: String::new(),
+        model: model.to_string(),
         messages: vec![Message {
             role: Role::User,
             content: MessageContent::Text(format!("Input:\n{}", conversation_text)),

@@ -2055,17 +2055,26 @@ impl OpenFangKernel {
 
                         if should_run_smart {
                         match kernel_clone.resolve_driver(&manifest) {
-                            Ok(driver_clone) => {
+                            Ok(agent_driver) => {
                                 let mem_clone = Arc::clone(&kernel_clone.memory);
                                 let emb_clone = kernel_clone.embedding_driver.clone();
-                                // Use smart_memory_model if configured, else fall back to
-                                // the agent's own model.
-                                let model = kernel_clone
-                                    .config
-                                    .memory
-                                    .smart_memory_model
-                                    .clone()
-                                    .unwrap_or_else(|| manifest.model.model.clone());
+                                
+                                let memory_config = &kernel_clone.config.memory;
+                                
+                                let (fact_driver, fact_model) = kernel_clone
+                                    .resolve_memory_llm_driver(
+                                        &memory_config.fact_extraction_llm,
+                                        &manifest,
+                                        agent_driver.clone(),
+                                    )?;
+                                
+                                let (decision_driver, decision_model) = kernel_clone
+                                    .resolve_memory_llm_driver(
+                                        &memory_config.memory_decision_llm,
+                                        &manifest,
+                                        agent_driver,
+                                    )?;
+                                
                                 let has_assistant = session
                                     .messages
                                     .iter()
@@ -2078,9 +2087,11 @@ impl OpenFangKernel {
                                         agent_id_for_smart,
                                         &new_msgs,
                                         &mem_clone,
-                                        driver_clone.as_ref(),
+                                        fact_driver.as_ref(),
+                                        decision_driver.as_ref(),
                                         emb_clone.as_deref(),
-                                        &model,
+                                        &fact_model,
+                                        &decision_model,
                                         has_assistant,
                                     )
                                     .await
@@ -2655,17 +2666,26 @@ impl OpenFangKernel {
 
             if should_run_smart {
             match self.resolve_driver(&manifest) {
-                Ok(driver_clone) => {
+                Ok(agent_driver) => {
                     let mem_clone = Arc::clone(&self.memory);
                     let emb_clone = self.embedding_driver.clone();
-                    // Use smart_memory_model if configured, else fall back to
-                    // the agent's own model.
-                    let model = self
-                        .config
-                        .memory
-                        .smart_memory_model
-                        .clone()
-                        .unwrap_or_else(|| manifest.model.model.clone());
+                    
+                    let memory_config = &self.config.memory;
+                    
+                    let (fact_driver, fact_model) = self
+                        .resolve_memory_llm_driver(
+                            &memory_config.fact_extraction_llm,
+                            &manifest,
+                            agent_driver.clone(),
+                        )?;
+                    
+                    let (decision_driver, decision_model) = self
+                        .resolve_memory_llm_driver(
+                            &memory_config.memory_decision_llm,
+                            &manifest,
+                            agent_driver,
+                        )?;
+                    
                     let has_assistant = session
                         .messages
                         .iter()
@@ -2677,9 +2697,11 @@ impl OpenFangKernel {
                             agent_id,
                             &new_msgs,
                             &mem_clone,
-                            driver_clone.as_ref(),
+                            fact_driver.as_ref(),
+                            decision_driver.as_ref(),
                             emb_clone.as_deref(),
-                            &model,
+                            &fact_model,
+                            &decision_model,
                             has_assistant,
                         )
                         .await
@@ -4887,6 +4909,46 @@ impl OpenFangKernel {
         }
 
         Ok(primary)
+    }
+
+    /// Resolve a memory LLM driver and model from config.
+    ///
+    /// If `config.provider` is set, creates a new driver using that provider.
+    /// Otherwise, falls back to the agent's own driver and model.
+    fn resolve_memory_llm_driver(
+        &self,
+        config: &openfang_types::config::MemoryLlmConfig,
+        manifest: &AgentManifest,
+        agent_driver: Arc<dyn LlmDriver>,
+    ) -> KernelResult<(Arc<dyn LlmDriver>, String)> {
+        if let Some(ref provider) = config.provider {
+            let api_key = config
+                .api_key_env
+                .as_ref()
+                .and_then(|env| self.resolve_credential(env));
+
+            let base_url = self.lookup_provider_url(provider);
+
+            let driver_config = DriverConfig {
+                provider: provider.clone(),
+                api_key,
+                base_url,
+                skip_permissions: true,
+            };
+
+            let driver = drivers::create_driver(&driver_config).map_err(|e| {
+                KernelError::BootFailed(format!("Memory LLM driver init failed: {e}"))
+            })?;
+
+            let model = config
+                .model
+                .clone()
+                .unwrap_or_else(|| manifest.model.model.clone());
+
+            Ok((driver, model))
+        } else {
+            Ok((agent_driver, manifest.model.model.clone()))
+        }
     }
 
     /// Connect to all configured MCP servers and cache their tool definitions.

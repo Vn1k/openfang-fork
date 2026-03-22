@@ -55,6 +55,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
         migrate_v11(conn)?;
     }
 
+    if current_version < 12 {
+        migrate_v12(conn)?;
+    }
+
     set_schema_version(conn, SCHEMA_VERSION)?;
     Ok(())
 }
@@ -396,6 +400,42 @@ fn migrate_v11(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(
         "INSERT OR IGNORE INTO migrations (version, applied_at, description) VALUES (11, datetime('now'), 'Add updated_at to memories')",
         [],
+    )?;
+    Ok(())
+}
+
+/// Version 12: Add personality_memories table — separate from semantic memories
+/// to prevent smart memory consolidation from contaminating personality data.
+///
+/// Design rationale:
+/// - Smart memory (fact extraction) targets `memories` table only
+/// - Personality (self, relationship, user_preference) lives here exclusively
+/// - `locked` prevents deletion of self-identity facts
+/// - `category` maps to PersonalityCategory enum
+/// - Embedding stored for future semantic search within personality scope
+fn migrate_v12(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS personality_memories (
+            id TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL,
+            content TEXT NOT NULL,
+            category TEXT NOT NULL,
+            locked INTEGER NOT NULL DEFAULT 0,
+            embedding BLOB DEFAULT NULL,
+            metadata TEXT NOT NULL DEFAULT '{}',
+            extraction_trigger TEXT NOT NULL DEFAULT 'periodic',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            deleted INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_personality_agent ON personality_memories(agent_id);
+        CREATE INDEX IF NOT EXISTS idx_personality_category ON personality_memories(agent_id, category);
+        CREATE INDEX IF NOT EXISTS idx_personality_deleted ON personality_memories(agent_id, deleted);
+ 
+        INSERT OR IGNORE INTO migrations (version, applied_at, description)
+        VALUES (12, datetime('now'), 'Add personality_memories table — isolated from semantic memories');
+        ",
     )?;
     Ok(())
 }

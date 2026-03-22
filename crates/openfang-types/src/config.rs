@@ -1544,36 +1544,40 @@ pub struct MemoryConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PersonalityConfig {
-    /// LLM for extracting personality memories.
+    /// LLM for personality extraction and implicit preference detection.
+    /// Recommended: a capable but cheap model like gpt-4o-mini.
     /// If not configured, falls back to the agent's own LLM.
     pub personality_llm: MemoryLlmConfig,
-    /// Extract personality every N conversations (0 = disabled).
+
+    /// Run full personality extraction every N conversations (0 = disabled).
+    /// Periodic extraction captures longer-term patterns across many exchanges.
     #[serde(default = "default_personality_extraction_interval")]
     pub extraction_interval: usize,
-    /// Patterns to detect explicit user preferences.
-    #[serde(default)]
-    pub preference_trigger_patterns: Vec<String>,
+
+    /// Enable implicit preference detection on every turn (or every N turns).
+    /// When true, the LLM scans recent messages for behavioral signals
+    /// without requiring explicit keywords from the user.
+    /// Default: true
+    #[serde(default = "default_true")]
+    pub implicit_detection_enabled: bool,
+
+    /// Run implicit preference detection every N turns (1 = every turn).
+    /// Increase to reduce LLM calls at the cost of detection latency.
+    /// Recommended: 1-3. Default: 1.
+    #[serde(default = "default_implicit_detection_interval")]
+    pub implicit_detection_interval: usize,
 }
 
-fn default_personality_extraction_interval() -> usize {
-    5
-}
+fn default_personality_extraction_interval() -> usize { 5 }
+fn default_implicit_detection_interval() -> usize { 1 }
 
 impl Default for PersonalityConfig {
     fn default() -> Self {
         Self {
             personality_llm: MemoryLlmConfig::default(),
             extraction_interval: 5,
-            preference_trigger_patterns: vec![
-                "be more".to_string(),
-                "i prefer you".to_string(),
-                "don't be".to_string(),
-                "i like when you".to_string(),
-                "i don't like when you".to_string(),
-                "can you be".to_string(),
-                "try to be".to_string(),
-                "i wish you were".to_string(),
-            ],
+            implicit_detection_enabled: true,
+            implicit_detection_interval: 1,
         }
     }
 }

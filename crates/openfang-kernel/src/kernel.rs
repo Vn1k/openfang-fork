@@ -439,9 +439,7 @@ async fn run_personality_extraction(
     model: &str,
     personality_config: &PersonalityConfig,
 ) -> KernelResult<()> {
-    use openfang_memory::personality::{detect_preference, extract_personality, should_extract_periodic, ExtractionTrigger};
-    use openfang_types::memory::MemorySource;
-    use openfang_types::message::Role;
+    use openfang_memory::personality::{consolidate_personality, detect_preference, extract_personality, should_extract_periodic, ExistingPersonalityMemory, ExtractionTrigger, PersonalityAction};
 
     let session = memory.get_session(session_id).map_err(KernelError::OpenFang)?;
     let messages = match session {
@@ -455,34 +453,72 @@ async fn run_personality_extraction(
 
     let conversation_count = messages.len() / 2;
 
+    // Periodic trigger takes priority — if it's time for periodic extraction, run it.
+    // Otherwise, always run implicit preference detection on recent messages.
+    // No keyword gate — LLM decides whether there is a signal worth acting on.
     let trigger = if personality_config.extraction_interval > 0
         && should_extract_periodic(conversation_count, personality_config.extraction_interval)
     {
+        tracing::info!(
+            agent_id = %agent_id,
+            conversation_count,
+            interval = personality_config.extraction_interval,
+            "Personality periodic trigger fired"
+        );
         Some(ExtractionTrigger::Periodic)
-    } else {
-        let last_user_msg = messages
-            .iter()
-            .rev()
-            .find(|m| m.role == Role::User)
-            .map(|m| m.content.text_content().to_string());
+    } else if personality_config.implicit_detection_enabled {
+        // Throttle: only run implicit detection every N turns
+        let implicit_interval = personality_config.implicit_detection_interval.max(1);
+        let should_detect = conversation_count % implicit_interval == 0;
 
-        if let Some(msg) = last_user_msg {
-            if !personality_config.preference_trigger_patterns.is_empty() {
-                match detect_preference(
-                    &msg,
-                    &personality_config.preference_trigger_patterns,
-                    llm_driver.as_ref(),
-                    model,
-                ).await {
-                    Ok(Some((t, _))) => Some(t),
-                    _ => None,
+        tracing::debug!(
+            agent_id = %agent_id,
+            conversation_count,
+            implicit_interval,
+            should_detect,
+            "Personality implicit detection check"
+        );
+
+        if should_detect {
+            tracing::info!(
+                agent_id = %agent_id,
+                model,
+                "Running implicit preference detection"
+            );
+            match detect_preference(
+                &messages,
+                llm_driver.as_ref(),
+                model,
+            ).await {
+                Ok(Some((t, summary))) => {
+                    tracing::info!(
+                        agent_id = %agent_id,
+                        trigger = ?t,
+                        summary = %summary,
+                        "Implicit preference signal detected"
+                    );
+                    Some(t)
+                },
+                Ok(None) => {
+                    tracing::info!(agent_id = %agent_id, "No preference signal detected this turn");
+                    None
+                },
+                Err(e) => {
+                    tracing::warn!(agent_id = %agent_id, "Implicit preference detection failed: {e}");
+                    None
                 }
-            } else {
-                None
             }
         } else {
+            tracing::debug!(
+                agent_id = %agent_id,
+                conversation_count,
+                implicit_interval,
+                "Implicit detection skipped (throttle)"
+            );
             None
         }
+    } else {
+        None
     };
 
     let trigger = match trigger {
@@ -504,29 +540,64 @@ async fn run_personality_extraction(
         return Ok(());
     }
 
-    for fact in extracted {
-        let category_str = match fact.category {
-            PersonalityCategory::Self_ => "self",
-            PersonalityCategory::Relationship => "relationship",
-            PersonalityCategory::UserPreference => "user_preference",
-        };
+    // ── Load existing personality memories for consolidation ────────────────
+    // We load all non-deleted memories for this agent to pass to the LLM.
+    // Personality memories are few enough (< 100 typically) that loading all
+    // is cheaper than doing per-fact embedding similarity queries.
+    let existing_raw = memory
+        .recall_personality_memories(agent_id, None, 200)
+        .map_err(KernelError::OpenFang)?;
 
-        let mut metadata = std::collections::HashMap::new();
-        metadata.insert("extraction_trigger".to_string(), serde_json::json!(extraction_trigger_str));
-        metadata.insert("category".to_string(), serde_json::json!(category_str));
+    let existing: Vec<ExistingPersonalityMemory> = existing_raw.iter()
+        .map(|m| ExistingPersonalityMemory {
+            id: m.id.clone(),
+            content: m.content.clone(),
+            locked: m.locked,
+        })
+        .collect();
 
-        let _ = memory
-            .remember_with_embedding_async(
-                agent_id,
-                &fact.content,
-                MemorySource::Personality,
-                "personality",
-                metadata,
-                None,
-                fact.locked,
-                Some(category_str),
-            )
-            .await;
+    // ── Consolidate: deduplicate new facts against existing memories ──────────
+    let consolidation = consolidate_personality(
+        extracted,
+        existing,
+        llm_driver.as_ref(),
+        model,
+    ).await.map_err(|e| KernelError::OpenFang(e))?;
+
+    tracing::info!(
+        agent_id = %agent_id,
+        facts_processed = consolidation.facts_processed,
+        existing_checked = consolidation.existing_checked,
+        actions = consolidation.actions.len(),
+        "Personality consolidation complete"
+    );
+
+    // ── Execute consolidation actions ─────────────────────────────────────────
+    for action in consolidation.actions {
+        match action {
+            PersonalityAction::Add { text, category, locked } => {
+                let category_str = match category {
+                    PersonalityCategory::Self_ => "self",
+                    PersonalityCategory::Relationship => "relationship",
+                    PersonalityCategory::UserPreference => "user_preference",
+                };
+                let metadata = serde_json::json!({
+                    "extraction_trigger": extraction_trigger_str,
+                    "category": category_str,
+                });
+                let _ = memory.save_personality_memory_async(
+                    agent_id, &text, category_str, locked,
+                    extraction_trigger_str, metadata,
+                ).await;
+            }
+            PersonalityAction::Update { memory_id, text, .. } => {
+                let _ = memory.update_personality_memory(&memory_id, &text);
+            }
+            PersonalityAction::Delete { memory_id } => {
+                let _ = memory.delete_personality_memory(&memory_id);
+            }
+            PersonalityAction::None => {}
+        }
     }
 
     Ok(())
@@ -2225,6 +2296,50 @@ impl OpenFangKernel {
                         } // end should_run_smart
                     }
 
+                    // Emergent personality extraction — streaming path
+                    // Mirrors the same logic as execute_llm_agent (sync path).
+                    let personality_config = &kernel_clone.config.memory.personality;
+                    tracing::debug!(
+                        agent_id = %agent_id,
+                        extraction_interval = personality_config.extraction_interval,
+                        implicit_enabled = personality_config.implicit_detection_enabled,
+                        "Personality extraction check (streaming)"
+                    );
+                    if personality_config.extraction_interval > 0 || personality_config.implicit_detection_enabled {
+                        let agent_id_for_extraction = agent_id;
+                        let mem_for_extraction = Arc::clone(&kernel_clone.memory);
+                        let personality_cfg = personality_config.clone();
+                        let session_id = session.id;
+
+                        let extract_result = match kernel_clone.resolve_driver(&manifest) {
+                            Ok(agent_driver) => {
+                                kernel_clone.resolve_memory_llm_driver(
+                                    &kernel_clone.config.memory.personality.personality_llm,
+                                    &manifest,
+                                    agent_driver,
+                                )
+                            }
+                            Err(e) => Err(e),
+                        };
+
+                        if let Ok((personality_driver, personality_model)) = extract_result {
+                            tokio::spawn(async move {
+                                if let Err(e) = run_personality_extraction(
+                                    agent_id_for_extraction,
+                                    session_id,
+                                    &mem_for_extraction,
+                                    personality_driver,
+                                    &personality_model,
+                                    &personality_cfg,
+                                ).await {
+                                    warn!(agent_id = %agent_id_for_extraction, "Personality extraction failed (streaming): {e}");
+                                }
+                            });
+                        } else if let Err(e) = extract_result {
+                            warn!(agent_id = %agent_id, "Personality LLM driver resolve failed (streaming): {e}");
+                        }
+                    }
+
                     // Post-loop compaction check: if session now exceeds token threshold,
                     // trigger compaction in background for the next call.
                     {
@@ -2833,9 +2948,10 @@ impl OpenFangKernel {
             } // end should_run_smart
         }
 
-        // Emergent personality extraction
+        // Emergent personality extraction — runs every turn via implicit LLM detection,
+        // or on periodic schedule. No keyword gate required.
         let personality_config = &self.config.memory.personality;
-        if personality_config.extraction_interval > 0 || !personality_config.preference_trigger_patterns.is_empty() {
+        if personality_config.extraction_interval > 0 || personality_config.implicit_detection_enabled {
             let agent_id_for_extraction = agent_id;
             let mem_for_extraction = Arc::clone(&self.memory);
             let personality_cfg = personality_config.clone();
@@ -3397,7 +3513,12 @@ impl OpenFangKernel {
         }
 
         let driver = self.resolve_driver(&entry.manifest)?;
-        let model = entry.manifest.model.model.clone();
+        // Strip provider prefix agar model string valid untuk API
+        // contoh: "openrouter/moonshotai/kimi-k2.5" → "moonshotai/kimi-k2.5"
+        let model = strip_provider_prefix(
+            &entry.manifest.model.model,
+            &entry.manifest.model.provider,
+        );
 
         let result = compact_session(driver, &model, &session, &config)
             .await

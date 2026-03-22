@@ -6,6 +6,7 @@
 //!   3. Returns ADD / UPDATE / DELETE / NONE decisions (caller executes them)
 
 use crate::extraction::ExtractedFact;
+use crate::prompt as prompts;
 use crate::MemorySubstrate;
 use openfang_types::agent::AgentId;
 use openfang_types::driver::embedding::EmbeddingDriver;
@@ -36,42 +37,11 @@ pub struct ConsolidationResult {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Consolidation prompt
+//
+// Re-uses DEFAULT_UPDATE_MEMORY_PROMPT from prompt.rs — single source of truth.
+// The prompt is assembled via update_memory_messages() which mirrors
+// mem0's get_update_memory_messages() including the "memory is empty" branch.
 // ─────────────────────────────────────────────────────────────────────────────
-
-pub const MEMORY_UPDATE_PROMPT: &str = r#"You are a smart memory manager which controls the memory of a system.
-You can perform four operations: (1) add into the memory, (2) update the memory, (3) delete from the memory, and (4) no change.
-
-Compare newly retrieved facts with the existing memory. For each new fact, decide whether to:
-- ADD: Add it to the memory as a new element
-- UPDATE: Update an existing memory element
-- DELETE: Delete an existing memory element
-- NONE: Make no change (if the fact is already present or irrelevant)
-
-Guidelines:
-1. **Add**: New information not present in memory → ADD with a new ID.
-2. **Update**: Information present but different → UPDATE keeping the same ID.
-   If "Likes cheese pizza" and new fact is "Loves cheese pizza" → NONE (same meaning).
-   If "User likes cricket" and new fact is "Loves cricket with friends" → UPDATE.
-3. **Delete**: New fact contradicts existing memory → DELETE.
-4. **No Change**: Fact already present and accurate → NONE.
-
-EXISTING MEMORIES:
-{existing_memories}
-
-NEW FACTS:
-{new_facts}
-
-Return ONLY a JSON object in this format:
-{
-  "memory": [
-    {"id": "0", "text": "updated text", "event": "UPDATE", "old_memory": "previous text"},
-    {"id": null, "text": "new fact text", "event": "ADD"},
-    {"id": "2", "text": "fact text", "event": "DELETE"},
-    {"id": "1", "text": "existing text", "event": "NONE"}
-  ]
-}
-
-Do not return anything except the JSON format."#;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Main consolidation entry point
@@ -151,18 +121,28 @@ pub async fn consolidate_memories(
         .map(|(i, uuid)| (i.to_string(), uuid.clone()))
         .collect();
 
-    // ── Build prompt ──────────────────────────────────────────────────────────
-    let existing_str: String = id_list.iter().enumerate()
-        .map(|(i, uuid)| format!("ID {}: {}", i, all_existing[uuid]))
-        .collect::<Vec<_>>().join("\n");
+    // ── Build prompt via prompt.rs (single source of truth) ─────────────────
+    // Format existing memories as JSON array matching mem0's convention
+    let existing_json: Vec<serde_json::Value> = id_list.iter().enumerate()
+        .map(|(i, uuid)| serde_json::json!({
+            "id": i.to_string(),
+            "text": all_existing[uuid]
+        }))
+        .collect();
+    let existing_str = serde_json::to_string(&existing_json).unwrap_or_default();
 
     let new_facts_str: String = new_facts.iter()
-        .map(|f| format!("- {}", f.content))
-        .collect::<Vec<_>>().join("\n");
+        .map(|f| f.content.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
 
-    let prompt = MEMORY_UPDATE_PROMPT
-        .replace("{existing_memories}", &existing_str)
-        .replace("{new_facts}", &new_facts_str);
+    // update_memory_messages() mirrors mem0's get_update_memory_messages()
+    // Includes: DEFAULT_UPDATE_MEMORY_PROMPT + existing memory block + new facts
+    let prompt = prompts::update_memory_messages(
+        Some(&existing_str),
+        &new_facts_str,
+        None, // use DEFAULT_UPDATE_MEMORY_PROMPT
+    );
 
     // ── Call LLM ─────────────────────────────────────────────────────────────
     let request = CompletionRequest {

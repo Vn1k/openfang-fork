@@ -624,6 +624,66 @@ You are a memory summarization system that records and preserves the complete in
 ```
 "#;
 
+/// Consolidation prompt for personality memories — behavior, relationship patterns,
+/// and user preferences.
+///
+/// Compared to [`DEFAULT_UPDATE_MEMORY_PROMPT`]:
+/// - Locked (Self_) memories cannot be deleted — only added or enriched via UPDATE
+/// - UPDATE is preferred over DELETE+ADD when meaning overlaps
+/// - MERGE logic is explicit: similar facts should be combined, not duplicated
+/// - DELETE is only for direct contradictions or outdated relationship/preference facts
+pub const PERSONALITY_CONSOLIDATION_PROMPT: &str = r#"You are a personality memory manager. Your job is to consolidate AI behavior observations, relationship patterns, and user preferences — keeping the memory lean, specific, and non-redundant.
+ 
+You can perform four operations:
+- ADD: Add a genuinely new observation not captured anywhere in existing memory
+- UPDATE: Enrich or correct an existing memory with more specific information
+- DELETE: Remove a memory that is directly contradicted or made fully obsolete
+- NONE: Keep as-is (fact already captured accurately)
+ 
+## Critical Rules
+ 
+**For Self (AI behavior) memories — marked with locked=true:**
+- NEVER DELETE. These are permanent behavioral observations.
+- NONE if the new fact conveys the same meaning, even with different wording.
+- UPDATE only to make the existing fact MORE specific or complete.
+- ADD only if the new fact describes a genuinely different behavior.
+ 
+**For Relationship and UserPreference memories — marked with locked=false:**
+- DELETE if directly contradicted by new evidence.
+- UPDATE if the pattern evolved or the new fact is more precise.
+- NONE if the same meaning is already captured.
+- ADD only if truly new information not covered by any existing entry.
+ 
+## Deduplication Rules (most important)
+These patterns MUST result in NONE, not ADD:
+- "User prefers brevity" + new: "User prefers short answers" → NONE (same meaning)
+- "User prefers brevity" + new: "User prefers extreme brevity, cuts off long responses" → UPDATE (more specific)
+- "I adjusted response length based on feedback" + new: "I shortened my response when told 'too long'" → NONE (same meaning)
+- "I shortened my response when told 'too long'" + new: "I compressed explanations iteratively when user requested brevity" → UPDATE (adds iteration detail)
+ 
+## What justifies ADD vs UPDATE vs NONE
+- ADD: The new fact describes a **completely different dimension** not touched by any existing entry
+- UPDATE: The new fact describes the **same dimension** but with more precision, context, or nuance
+- NONE: The new fact is **semantically equivalent** to an existing entry — different words, same meaning
+ 
+EXISTING MEMORIES:
+{existing_memories}
+ 
+NEW OBSERVATIONS:
+{new_facts}
+ 
+Return ONLY a JSON object. No explanation, no markdown:
+{
+  "memory": [
+    {"id": "0", "text": "enriched text", "event": "UPDATE", "old_memory": "previous text"},
+    {"id": null, "text": "new unique observation", "event": "ADD"},
+    {"id": "2", "text": "contradicted fact", "event": "DELETE"},
+    {"id": "1", "text": "unchanged fact", "event": "NONE"}
+  ]
+}
+ 
+Do not return anything except the JSON format."#;
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Tests
 // ═════════════════════════════════════════════════════════════════════════════

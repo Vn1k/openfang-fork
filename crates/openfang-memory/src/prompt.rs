@@ -638,12 +638,10 @@ You are a memory summarization system that records and preserves the complete in
 // ═════════════════════════════════════════════════════════════════════════════
 
 /// Unified personality extraction prompt — extracts AND categorizes all
-/// observations in a single LLM call, following mem0-style with few-shot examples.
+/// observations in a single LLM call.
 ///
-/// Replaces three separate extraction calls with one unified call that:
-/// - Extracts PATTERNS across the conversation, not single-instance events
-/// - Categorizes correctly using strict subject rules + penalty warnings
-/// - Limits output to 2-3 per category (max 9 total) for quality over quantity
+/// Output is a JSON array where each item has `content` and `category`.
+/// This replaces the three separate SELF/RELATIONSHIP/USER_PREFERENCE prompts.
 pub const PERSONALITY_EXTRACTION_PROMPT: &str = r#"You are a Personality Organizer, specialized in extracting recurring behavioral patterns, interaction dynamics, and user preferences from AI conversations.
 Your primary role is to identify PATTERNS that repeat or are strongly evidenced — not one-time events.
 This allows the AI to adapt its behavior and communication style in future interactions.
@@ -659,8 +657,8 @@ Category "self" — How the AI behaved CONSISTENTLY across this conversation:
 2. Teaching approach: How AI structured explanations when the user needed clarification
 3. Problem-solving style: How AI handled uncertainty, disagreement, or user frustration
 
-# [IMPORTANT]: "self" subject MUST start with "I" (the AI). NEVER "User ...".
-# [IMPORTANT]: YOU WILL BE PENALIZED IF "self" observations describe user behavior.
+# [IMPORTANT]: "self" subject MUST start with "I" (the AI). NEVER "User ...", "Dynamic ...", or "Relationship ...".
+# [IMPORTANT]: YOU WILL BE PENALIZED IF "self" observations describe user behavior or interaction dynamics.
 
 Category "user_preference" — What this user consistently signals about how they want to be helped:
 1. Communication style: Length, format, tone preferences (explicit or implicit)
@@ -674,6 +672,7 @@ Category "relationship" — The recurring dynamic between this AI-user pair:
 
 Here are some few-shot examples:
 
+--- EXAMPLE 1: Pattern repeated multiple times → EXTRACT ---
 Input:
 User: hey
 Assistant: Hi! I'm Assistant, an AI that can help with research, writing, coding, and more. What's your name?
@@ -687,6 +686,7 @@ Output: {"observations": [
   {"content": "User establishes behavioral rules for AI immediately and tests compliance before continuing", "category": "relationship"}
 ]}
 
+--- EXAMPLE 2: Pattern repeated multiple times → EXTRACT ---
 Input:
 User: what's the difference between consulting and coaching?
 Assistant: [explanation with table]
@@ -700,6 +700,26 @@ Output: {"observations": [
   {"content": "Interaction follows pattern: user raises doubt → AI provides framework → user pivots to next practical concern", "category": "relationship"}
 ]}
 
+--- EXAMPLE 3: Strong single signal (explicit emotional context) → EXTRACT ---
+Input:
+User: so i need to vent a bit
+Assistant: Of course, I'm here to listen. What's going on?
+User: there's this coworker who keeps taking credit for my work
+Assistant: That's really frustrating. How long has this been going on?
+User: like 3 months, it's starting to affect how my manager sees me
+Assistant: I can see why that's stressful. Would you like to talk through how to handle it?
+User: yeah but this person is well-liked so if i say something i might look bad
+Output: {"observations": [
+  {"content": "I responded to emotional opening by offering space and validation before moving to problem-solving", "category": "self"},
+  {"content": "User shares personal situations progressively — starts with venting, reveals strategic concerns only after safety is established", "category": "user_preference"},
+  {"content": "User explicitly states fears about social consequences before committing to any action", "category": "user_preference"},
+  {"content": "Relationship functions as safe space: user vents, AI validates, then user reveals the real concern", "category": "relationship"}
+]}
+
+//Note: "User initially frames issues as venting but reveals strategic concerns after trust" is NOT "self" — it describes user behavior → user_preference.
+//Note: "Dynamic established: AI as patient witness" is NOT "self" — it describes both sides → relationship.
+
+--- EXAMPLE 4: Trivial exchange, nothing meaningful → EMPTY ---
 Input:
 User: hi
 Assistant: Hello!
@@ -710,12 +730,14 @@ Return the observations in the JSON format shown above.
 
 Remember the following:
 # [IMPORTANT]: EXTRACT PATTERNS, NOT SINGLE EVENTS. One-time formatting choices, specific examples used once, or isolated responses are NOT patterns.
-# [IMPORTANT]: DO NOT extract observations like "I used a markdown table" — this is a single-instance formatting choice, not a behavioral pattern.
+# [IMPORTANT]: DO NOT extract "self" observations like "I used a markdown table" — single-instance choice, not a behavioral pattern.
+# [IMPORTANT]: "self" MUST start with "I" and describe what the AI DID. "User..." → user_preference. "Dynamic..." or "Relationship..." → relationship.
 # [IMPORTANT]: Maximum 2-3 per category. If you find more, keep only the most significant ones.
+# [IMPORTANT]: Relationship observations must NEVER contain the word "I" — they describe the dynamic between both parties only.
+# [IMPORTANT]: Keep every observation under 30 words. Be extremely concise.
 - Do not return anything from the few-shot examples above.
-- If you do not find a clear pattern evidenced by multiple signals or a strong single signal, return empty for that category.
+- If you do not find a clear pattern, return empty for that category.
 - Make sure each "self" observation starts with "I" and describes AI behavior only.
-- Make sure "user_preference" observations describe the user, not the AI.
 - Return ONLY valid JSON. No explanation, no markdown, no preamble."#;
 
 /// Consolidation prompt for personality memories — behavior, relationship patterns,
@@ -726,54 +748,57 @@ Remember the following:
 /// - UPDATE is preferred over DELETE+ADD when meaning overlaps
 /// - MERGE logic is explicit: similar facts should be combined, not duplicated
 /// - DELETE is only for direct contradictions or outdated relationship/preference facts
-pub const PERSONALITY_CONSOLIDATION_PROMPT: &str = r#"You are a smart personality memory manager which controls the behavioral memory of an AI system.
-You can perform four operations: (1) add into the memory, (2) update the memory, (3) delete from the memory, and (4) no change.
-
-Compare newly extracted observations with the existing personality memory. For each new observation, decide whether to:
-- ADD: Add it as a new memory element if it describes a genuinely new behavioral pattern or preference
-- UPDATE: Update an existing memory element if the new observation is more specific or adds nuance
-- DELETE: Delete an existing memory element if directly contradicted (only for non-locked memories)
-- NONE: Make no change if the observation is already captured or conveys the same meaning
-
-# [IMPORTANT]: LOCKED memories (self/AI behavior) can NEVER be deleted. Only ADD or UPDATE.
-# [IMPORTANT]: YOU WILL BE PENALIZED FOR ADDING OBSERVATIONS THAT CONVEY THE SAME MEANING AS EXISTING MEMORIES.
-
-There are specific guidelines to select which operation to perform:
-
-1. **Add**: If the observation describes a behavioral pattern, preference, or dynamic not present in memory.
-- Example: Memory has "User prefers brevity" and new observation is "User drives abrupt topic shifts" → ADD (different dimension)
-
-2. **Update**: If the observation is about the same dimension but with more precision or context.
-- Example (a): Memory has "I adapted my tone based on feedback" and new is "I switched from formal to casual immediately when user said 'just call me v'" → UPDATE (more specific instance)
-- Example (b): Memory has "User prefers short answers" and new is "User explicitly sets response length constraints early in every conversation" → UPDATE (adds behavioral pattern)
-- If memory contains "I adjusted response length" and new is "I shortened responses when told too long" → NONE (same meaning, different words)
-
-3. **Delete**: Only for relationship and user_preference memories that are directly contradicted.
-- Example: Memory has "User prefers formal tone" and new observation shows "User explicitly requested casual language" → DELETE old, ADD new
-
-4. **No Change**: If the observation is already present or conveys the same meaning with different wording.
-- Example: Memory has "User prefers brevity" and new is "User wants short answers" → NONE (same meaning)
-- Example: Memory has "I used structured comparisons to clarify terms" and new is "I used a table to contrast consulting vs coaching" → NONE (same behavior, one instance of existing pattern)
-
-# [IMPORTANT]: "Same meaning" test — ask yourself: would a human reading both say they describe the same thing? If yes → NONE.
-# [IMPORTANT]: One-time specific examples (a particular table, a specific emoji) are NOT new patterns if the general behavior is already captured.
-
+pub const PERSONALITY_CONSOLIDATION_PROMPT: &str = r#"You are a personality memory manager. Your job is to consolidate AI behavior observations, relationship patterns, and user preferences — keeping the memory lean, specific, and non-redundant.
+ 
+You can perform four operations:
+- ADD: Add a genuinely new observation not captured anywhere in existing memory
+- UPDATE: Enrich or correct an existing memory with more specific information
+- DELETE: Remove a memory that is directly contradicted or made fully obsolete
+- NONE: Keep as-is (fact already captured accurately)
+ 
+## Critical Rules
+ 
+**For Self (AI behavior) memories — marked with locked=true:**
+- NEVER DELETE. These are permanent behavioral observations.
+- NONE if the new fact conveys the same meaning, even with different wording.
+- UPDATE only to make the existing fact MORE specific or complete.
+- ADD only if the new fact describes a genuinely different behavior.
+ 
+**For Relationship and UserPreference memories — marked with locked=false:**
+- DELETE if directly contradicted by new evidence.
+- UPDATE if the pattern evolved or the new fact is more precise.
+- NONE if the same meaning is already captured.
+- ADD only if truly new information not covered by any existing entry.
+ 
+## Deduplication Rules (most important)
+These patterns MUST result in NONE, not ADD:
+- "User prefers brevity" + new: "User prefers short answers" → NONE (same meaning)
+- "User prefers brevity" + new: "User prefers extreme brevity, cuts off long responses" → UPDATE (more specific)
+- "I adjusted response length based on feedback" + new: "I shortened my response when told 'too long'" → NONE (same meaning)
+- "I shortened my response when told 'too long'" + new: "I compressed explanations iteratively when user requested brevity" → UPDATE (adds iteration detail)
+ 
+## What justifies ADD vs UPDATE vs NONE
+- ADD: The new fact describes a **completely different dimension** not touched by any existing entry
+- UPDATE: The new fact describes the **same dimension** but with more precision, context, or nuance
+- NONE: The new fact is **semantically equivalent** to an existing entry — different words, same meaning
+ 
 EXISTING MEMORIES:
 {existing_memories}
-
+ 
 NEW OBSERVATIONS:
 {new_facts}
-
-Return ONLY a JSON object in this format:
+ 
+Return ONLY a JSON object. No explanation, no markdown:
 {
   "memory": [
-    {"id": "0", "text": "updated observation text", "event": "UPDATE", "old_memory": "previous text"},
-    {"id": null, "text": "new unique pattern", "event": "ADD"},
-    {"id": "2", "text": "contradicted observation", "event": "DELETE"},
-    {"id": "1", "text": "existing observation unchanged", "event": "NONE"}
+    {"id": "0", "text": "enriched text", "event": "UPDATE", "old_memory": "previous text"},
+    {"id": null, "text": "new unique observation", "event": "ADD"},
+    {"id": "2", "text": "contradicted fact", "event": "DELETE"},
+    {"id": "1", "text": "unchanged fact", "event": "NONE"}
   ]
 }
-
+ 
+- If a new observation exceeds 30 words, shorten it to under 30 words during UPDATE or ADD while preserving the core meaning.
 Do not return anything except the JSON format."#;
 
 // ═════════════════════════════════════════════════════════════════════════════

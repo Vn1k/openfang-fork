@@ -438,6 +438,7 @@ async fn run_personality_extraction(
     llm_driver: Arc<dyn LlmDriver>,
     model: &str,
     personality_config: &PersonalityConfig,
+    embedding_driver: Option<Arc<dyn openfang_types::driver::embedding::EmbeddingDriver + Send + Sync>>,
 ) -> KernelResult<()> {
     use openfang_memory::personality::{consolidate_personality, detect_preference, extract_personality, should_extract_periodic, ExistingPersonalityMemory, ExtractionTrigger, PersonalityAction};
 
@@ -585,13 +586,23 @@ async fn run_personality_extraction(
                     "extraction_trigger": extraction_trigger_str,
                     "category": category_str,
                 });
+                // Embed the content if embedding driver is available
+                let embedding = match &embedding_driver {
+                    Some(drv) => drv.embed_one(&text).await.ok(),
+                    None => None,
+                };
                 let _ = memory.save_personality_memory_async(
                     agent_id, &text, category_str, locked,
-                    extraction_trigger_str, metadata,
+                    extraction_trigger_str, metadata, embedding,
                 ).await;
             }
             PersonalityAction::Update { memory_id, text, .. } => {
-                let _ = memory.update_personality_memory(&memory_id, &text);
+                // Re-embed on update so vector stays in sync with new content
+                let embedding = match &embedding_driver {
+                    Some(drv) => drv.embed_one(&text).await.ok().map(|v| v),
+                    None => None,
+                };
+                let _ = memory.update_personality_memory_with_embedding(&memory_id, &text, embedding);
             }
             PersonalityAction::Delete { memory_id } => {
                 let _ = memory.delete_personality_memory(&memory_id);
@@ -2108,7 +2119,7 @@ impl OpenFangKernel {
                         warn!(agent_id = %agent_id, "Failed to load workspace skills (streaming): {e}");
                     }
                 }
-            }
+            } 
 
             // Create a phase callback that emits PhaseChange events to WS/SSE clients
             let phase_tx = tx.clone();
@@ -2323,6 +2334,7 @@ impl OpenFangKernel {
                         };
 
                         if let Ok((personality_driver, personality_model)) = extract_result {
+                            let emb_for_personality = kernel_clone.embedding_driver.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = run_personality_extraction(
                                     agent_id_for_extraction,
@@ -2331,6 +2343,7 @@ impl OpenFangKernel {
                                     personality_driver,
                                     &personality_model,
                                     &personality_cfg,
+                                    emb_for_personality,
                                 ).await {
                                     warn!(agent_id = %agent_id_for_extraction, "Personality extraction failed (streaming): {e}");
                                 }
@@ -2971,6 +2984,7 @@ impl OpenFangKernel {
             };
 
             if let Ok((personality_driver, personality_model)) = extract_result {
+                let emb_for_personality = self.embedding_driver.clone();
                 tokio::spawn(async move {
                     if let Err(e) = run_personality_extraction(
                         agent_id_for_extraction,
@@ -2979,6 +2993,7 @@ impl OpenFangKernel {
                         personality_driver,
                         &personality_model,
                         &personality_cfg,
+                        emb_for_personality,
                     ).await {
                         warn!(agent_id = %agent_id_for_extraction, "Personality extraction failed: {e}");
                     }
@@ -4792,6 +4807,24 @@ impl OpenFangKernel {
 
                     // --- Auto-recovery for crashed agents ---
                     if status.state == AgentState::Crashed {
+                        // Skip recovery for Reactive agents — they don't need it.
+                        // Reactive agents only run when a user message arrives, so
+                        // "crashing" is meaningless for them. Attempting recovery
+                        // causes a set_state(Running) which then triggers the
+                        // heartbeat's unresponsive check again, creating a cycle.
+                        // More importantly, if the agent somehow ends up in a
+                        // Continuous background loop (e.g. via a Hand that was
+                        // misconfigured), skipping recovery prevents spurious
+                        // background API calls with 24K+ token session contexts.
+                        if let Some(entry) = kernel.registry.get(status.agent_id) {
+                            use openfang_types::agent::ScheduleMode;
+                            if matches!(entry.manifest.schedule, ScheduleMode::Reactive) {
+                                // Just reset state to Running silently — no recovery loop needed
+                                let _ = kernel.registry.set_state(status.agent_id, AgentState::Running);
+                                continue;
+                            }
+                        }
+
                         let failures = recovery_tracker.failure_count(status.agent_id);
 
                         if failures >= config.max_recovery_attempts {
@@ -4875,6 +4908,22 @@ impl OpenFangKernel {
 
                     // --- Unresponsive Running agent ---
                     if status.unresponsive && status.state == AgentState::Running {
+                        // Only mark background agents (Continuous/Periodic) as Crashed.
+                        // Reactive agents are idle by design when no user is chatting —
+                        // marking them Crashed and recovering them causes spurious
+                        // background API calls with the full session context.
+                        let is_background = if let Some(entry) = kernel.registry.get(status.agent_id) {
+                            use openfang_types::agent::ScheduleMode;
+                            matches!(entry.manifest.schedule, ScheduleMode::Continuous { .. } | ScheduleMode::Periodic { .. })
+                        } else {
+                            false
+                        };
+
+                        if !is_background {
+                            // Reactive agent idle — just leave it Running, no crash/recovery needed
+                            continue;
+                        }
+
                         // Mark as Crashed so next cycle triggers recovery
                         let _ = kernel
                             .registry

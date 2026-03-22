@@ -30,128 +30,6 @@ pub enum ExtractionTrigger {
     ImplicitPreference,
 }
 
-
-/// Action decided by consolidation LLM for one personality memory entry.
-#[derive(Debug, Clone, PartialEq)]
-pub enum PersonalityAction {
-    Add { text: String, category: PersonalityCategory, locked: bool },
-    Update { memory_id: String, text: String, old_text: String },
-    Delete { memory_id: String },
-    None,
-}
-
-/// Result of one full personality consolidation run.
-#[derive(Debug)]
-pub struct PersonalityConsolidationResult {
-    pub actions: Vec<PersonalityAction>,
-    pub facts_processed: usize,
-    pub existing_checked: usize,
-}
-
-/// A reference to an existing personality memory for consolidation input.
-#[derive(Debug, Clone)]
-pub struct ExistingPersonalityMemory {
-    pub id: String,
-    pub content: String,
-    pub locked: bool,
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Prompt builders
-// ─────────────────────────────────────────────────────────────────────────────
-
-const SELF_EXTRACTION_PROMPT: &str = r#"You are analyzing a conversation to extract facts about HOW THE AI BEHAVED in this specific interaction.
-
-Your task: identify concrete, observable patterns in the AI's behavior — not generic traits, not aspirations, not what the AI "tries" to do.
-
-ONLY extract facts that are clearly evidenced by what actually happened in the conversation.
-DO NOT extract vague traits like "I am helpful" or "I try to be honest" — these are assumed baselines, not meaningful observations.
-DO NOT invent or infer things that are not directly shown.
-Write each fact in first person from the AI's perspective.
-
-Good examples (specific, evidenced):
-- "I used humor to diffuse tension when the user expressed frustration"
-- "I gave step-by-step breakdowns when the user asked technical questions"
-- "I asked follow-up questions rather than assuming what the user meant"
-- "I kept responses under 3 sentences when the user gave short replies"
-
-Bad examples (too vague, not evidenced):
-- "I am caring and empathetic"
-- "I try to be helpful"
-- "I value honesty"
-
-Return ONLY valid JSON. No explanation, no markdown, no preamble:
-{"personality_facts": ["fact 1", "fact 2"]}
-
-Return {"personality_facts": []} if nothing concrete and specific was observed."#;
-
-const RELATIONSHIP_EXTRACTION_PROMPT: &str = r#"You are analyzing a conversation to extract facts about the DYNAMIC AND PATTERN between the AI and this specific user.
-
-Your task: identify observable relationship patterns — how this particular AI-user pair interacts, not generic observations.
-
-Focus on:
-- The energy and tone of their interaction (casual vs formal, warm vs transactional, collaborative vs directive)
-- How the user engages with the AI (trusting, skeptical, exploratory, task-focused)
-- Recurring interaction patterns that define THIS relationship specifically
-- What seems to work well or poorly between them
-
-ONLY extract facts clearly supported by the conversation.
-DO NOT extract what either party "should" do or generic advice.
-Each fact should describe the relationship as it IS, not as it could be.
-
-Good examples:
-- "User treats AI as a thinking partner, often asking for opinions rather than just facts"
-- "User skips pleasantries and goes straight to the point — interaction is purely task-focused"
-- "User pushes back when they disagree, and the conversation becomes more collaborative after"
-- "User frequently uses humor, and AI mirroring this creates visible rapport"
-
-Bad examples:
-- "We have a good relationship"
-- "User seems to like talking to me"
-- "I should be more patient with this user"
-
-Return ONLY valid JSON. No explanation, no markdown, no preamble:
-{"relationship_facts": ["fact 1", "fact 2"]}
-
-Return {"relationship_facts": []} if no clear pattern is observable yet."#;
-
-const USER_PREFERENCE_EXTRACTION_PROMPT: &str = r#"You are analyzing a conversation to extract THIS USER'S communication preferences and behavioral signals.
-
-Your task: identify how this specific user prefers to interact — both from explicit statements AND implicit behavioral signals.
-
-Implicit signals to look for:
-- User cuts off long responses → prefers brevity
-- User asks for more detail → prefers depth
-- User uses informal language → prefers casual tone
-- User ignores emotional acknowledgments → prefers direct problem-solving
-- User asks follow-up questions → engaged and exploratory
-- User gives one-word answers → busy, disengaged, or overwhelmed
-- User circles back to the same topic → something important was missed or unresolved
-- User corrects the AI → values precision over agreeableness
-
-Explicit signals: anything the user directly states about how they want the AI to respond.
-
-ONLY extract preferences clearly evidenced by the conversation.
-Write each fact as a specific, actionable observation about the user.
-DO NOT write generic traits like "user is smart" or "user likes AI".
-
-Good examples:
-- "User prefers bullet points over paragraphs when receiving instructions"
-- "User gets impatient with caveats — wants the direct answer first"
-- "User explicitly asked to skip explanations and just give the result"
-- "User responds more positively when AI acknowledges the difficulty of their situation before solving"
-- "User uses Indonesian when relaxed, switches to English for technical topics"
-
-Bad examples:
-- "User likes good answers"
-- "User prefers helpful responses"
-- "User is technical"
-
-Return ONLY valid JSON. No explanation, no markdown, no preamble:
-{"user_preferences": ["fact 1", "fact 2"]}
-
-Return {"user_preferences": []} if no clear preference signals were observed."#;
-
 const PREFERENCE_DETECTION_PROMPT: &str = r#"You are analyzing recent conversation messages to detect whether the user is signaling — explicitly or implicitly — how they want the AI to behave.
 
 EXPLICIT signals (user directly states a preference):
@@ -195,6 +73,13 @@ or
 ///
 /// # Returns
 /// `Vec<ExtractedPersonality>` — personality memories categorized.
+/// Extract personality observations using a single unified LLM call.
+///
+/// Replaces the previous 3-call approach (self + relationship + user_preference).
+/// A single LLM now extracts AND categorizes all observations together, which:
+/// - Eliminates cross-category confusion (facts about user landing in "self")
+/// - Reduces LLM calls: extraction 3 → 1 (total pipeline: 5 → 2)
+/// - Mirrors smart_memory's proven single-call extraction approach
 pub async fn extract_personality(
     messages: &[Message],
     _trigger: ExtractionTrigger,
@@ -206,73 +91,16 @@ pub async fn extract_personality(
         return Ok(vec![]);
     }
 
-    let mut all_facts: Vec<ExtractedPersonality> = Vec::new();
-
-    // Extract self facts
-    let self_facts = extract_category(
-        &conversation_text,
-        "self",
-        SELF_EXTRACTION_PROMPT,
-        llm_driver,
-        model,
-    )
-    .await?;
-    all_facts.extend(self_facts);
-
-    // Extract relationship facts
-    let relationship_facts = extract_category(
-        &conversation_text,
-        "relationship",
-        RELATIONSHIP_EXTRACTION_PROMPT,
-        llm_driver,
-        model,
-    )
-    .await?;
-    all_facts.extend(relationship_facts);
-
-    // Extract user preference facts
-    let user_facts = extract_category(
-        &conversation_text,
-        "user_preference",
-        USER_PREFERENCE_EXTRACTION_PROMPT,
-        llm_driver,
-        model,
-    )
-    .await?;
-    all_facts.extend(user_facts);
-
-    Ok(all_facts)
-}
-
-/// Detect if recent messages contain a preference signal — explicit or implicit.
-///
-/// Analyzes the last N messages as a unit rather than a single message,
-/// enabling detection of implicit behavioral signals spread across turns.
-/// No keyword gate — always uses LLM for consistent, context-aware detection.
-pub async fn detect_preference(
-    messages: &[Message],
-    llm_driver: &dyn LlmDriver,
-    model: &str,
-) -> OpenFangResult<Option<(ExtractionTrigger, String)>> {
-    // Build a compact text of the last 6 messages (3 exchanges)
-    // Enough context to catch implicit signals without overloading the prompt
-    let recent_text = build_recent_messages_text(messages, 6);
-    if recent_text.trim().is_empty() {
-        return Ok(None);
-    }
-
     let request = CompletionRequest {
         model: model.to_string(),
         messages: vec![Message {
             role: Role::User,
-            content: MessageContent::Text(
-                PREFERENCE_DETECTION_PROMPT.replace("{messages}", &recent_text),
-            ),
+            content: MessageContent::Text(format!("Conversation:\n{}", conversation_text)),
         }],
         tools: vec![],
-        max_tokens: 256,
-        temperature: 0.0, // deterministic — this is a classification task
-        system: None,
+        max_tokens: 1024,
+        temperature: 0.1,
+        system: Some(prompts::PERSONALITY_EXTRACTION_PROMPT.to_string()),
         thinking: None,
     };
 
@@ -282,30 +110,80 @@ pub async fn detect_preference(
         .map_err(|e| OpenFangError::LlmDriver(e.to_string()))?;
 
     let raw = response.text();
-    if let Some(detection) = parse_preference_detection(&raw) {
-        if detection.has_preference {
-            let trigger = match detection.preference_type.as_str() {
-                "explicit" => ExtractionTrigger::ExplicitPreference,
-                _ => ExtractionTrigger::ImplicitPreference,
-            };
-            return Ok(Some((trigger, detection.summary)));
-        }
+    parse_unified_personality_json(&raw)
+}
+
+fn parse_unified_personality_json(text: &str) -> OpenFangResult<Vec<ExtractedPersonality>> {
+    let start = text.find('{').ok_or_else(|| {
+        OpenFangError::Serialization("No JSON in unified personality response".to_string())
+    })?;
+    let end = text.rfind('}').map(|i| i + 1).ok_or_else(|| {
+        OpenFangError::Serialization("Malformed JSON in unified personality response".to_string())
+    })?;
+    if end <= start {
+        return Ok(vec![]);
     }
 
-    Ok(None)
+    let value: serde_json::Value = serde_json::from_str(&text[start..end])
+        .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
+
+    let observations = match value.get("observations").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => return Ok(vec![]),
+    };
+
+    let mut result = Vec::new();
+    for obs in observations {
+        let content = match obs.get("content").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => continue,
+        };
+        let category_str = obs.get("category").and_then(|v| v.as_str()).unwrap_or("self");
+
+        let (category, locked) = match category_str {
+            "self" => (PersonalityCategory::Self_, true),
+            "relationship" => (PersonalityCategory::Relationship, false),
+            "user_preference" => (PersonalityCategory::UserPreference, false),
+            _ => continue,
+        };
+
+        result.push(ExtractedPersonality { content, category, locked });
+    }
+
+    Ok(result)
 }
 
 
+/// Action decided by consolidation LLM for one personality memory entry.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PersonalityAction {
+    Add { text: String, category: PersonalityCategory, locked: bool },
+    Update { memory_id: String, text: String, old_text: String },
+    Delete { memory_id: String },
+    None,
+}
+
+/// Result of one full personality consolidation run.
+#[derive(Debug)]
+pub struct PersonalityConsolidationResult {
+    pub actions: Vec<PersonalityAction>,
+    pub facts_processed: usize,
+    pub existing_checked: usize,
+}
+
+/// A reference to an existing personality memory for consolidation input.
+#[derive(Debug, Clone)]
+pub struct ExistingPersonalityMemory {
+    pub id: String,
+    pub content: String,
+    pub locked: bool,
+}
+
 /// Consolidate newly extracted personality facts against existing memories.
 ///
-/// Unlike smart memory consolidation which uses embedding similarity for recall,
-/// personality consolidation passes ALL existing memories in the same category —
-/// personality memories are few (typically < 30 per category) and must be
-/// compared holistically to avoid semantic duplicates.
-///
-/// ## Locked memory protection
-/// Self_ memories (locked=true) are passed with a locked marker so the LLM
-/// knows not to DELETE them — only ADD or UPDATE is allowed.
+/// Passes all existing memories to LLM for holistic deduplication — personality
+/// memories are few enough that loading all is more accurate than per-fact recall.
+/// Locked (Self_) memories are protected from deletion.
 pub async fn consolidate_personality(
     new_facts: Vec<ExtractedPersonality>,
     existing: Vec<ExistingPersonalityMemory>,
@@ -353,7 +231,6 @@ pub async fn consolidate_personality(
         .collect::<Vec<_>>()
         .join("\n");
 
-    // Build new facts string
     let new_facts_str: String = new_facts.iter()
         .map(|f| format!("- {}", f.content))
         .collect::<Vec<_>>()
@@ -370,7 +247,7 @@ pub async fn consolidate_personality(
             content: MessageContent::Text(prompt_text),
         }],
         tools: vec![],
-        max_tokens: 2048,
+        max_tokens: 4096,
         temperature: 0.1,
         system: None,
         thinking: None,
@@ -428,7 +305,6 @@ fn parse_personality_actions(
         match event {
             "ADD" => {
                 if !text_val.is_empty() {
-                    // Match back to original extracted fact to get category + locked
                     let matching_fact = new_facts.iter()
                         .find(|f| f.content.trim() == text_val.trim())
                         .cloned()
@@ -457,21 +333,74 @@ fn parse_personality_actions(
             }
             "DELETE" => {
                 if let Some(real_uuid) = int_to_uuid.get(&int_id) {
-                    // Enforce locked protection: never delete locked memories
                     let is_locked = uuid_to_locked.get(real_uuid).copied().unwrap_or(false);
                     if !is_locked {
                         actions.push(PersonalityAction::Delete {
                             memory_id: real_uuid.clone(),
                         });
                     }
-                    // If locked, silently ignore DELETE — the LLM should not have issued it
                 }
             }
-            _ => {} // NONE — no action
+            _ => {}
         }
     }
 
     Ok(actions)
+}
+
+/// Detect if recent messages contain a preference signal — explicit or implicit.
+///
+/// Analyzes the last N messages as a unit rather than a single message,
+/// enabling detection of implicit behavioral signals spread across turns.
+/// Detect if recent messages contain a preference signal — explicit or implicit.
+///
+/// Analyzes the last N messages as a unit rather than a single message,
+/// enabling detection of implicit behavioral signals spread across turns.
+/// No keyword gate — always uses LLM for consistent, context-aware detection.
+pub async fn detect_preference(
+    messages: &[Message],
+    llm_driver: &dyn LlmDriver,
+    model: &str,
+) -> OpenFangResult<Option<(ExtractionTrigger, String)>> {
+    // Build a compact text of the last 6 messages (3 exchanges)
+    // Enough context to catch implicit signals without overloading the prompt
+    let recent_text = build_recent_messages_text(messages, 6);
+    if recent_text.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let request = CompletionRequest {
+        model: model.to_string(),
+        messages: vec![Message {
+            role: Role::User,
+            content: MessageContent::Text(
+                PREFERENCE_DETECTION_PROMPT.replace("{messages}", &recent_text),
+            ),
+        }],
+        tools: vec![],
+        max_tokens: 256,
+        temperature: 0.0, // deterministic — this is a classification task
+        system: None,
+        thinking: None,
+    };
+
+    let response = llm_driver
+        .complete(request)
+        .await
+        .map_err(|e| OpenFangError::LlmDriver(e.to_string()))?;
+
+    let raw = response.text();
+    if let Some(detection) = parse_preference_detection(&raw) {
+        if detection.has_preference {
+            let trigger = match detection.preference_type.as_str() {
+                "explicit" => ExtractionTrigger::ExplicitPreference,
+                _ => ExtractionTrigger::ImplicitPreference,
+            };
+            return Ok(Some((trigger, detection.summary)));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Check if periodic extraction should run based on conversation count.
@@ -526,85 +455,6 @@ fn build_recent_messages_text(messages: &[Message], n: usize) -> String {
         }
     }
     text
-}
-
-async fn extract_category(
-    conversation: &str,
-    category: &str,
-    prompt: &str,
-    llm_driver: &dyn LlmDriver,
-    model: &str,
-) -> OpenFangResult<Vec<ExtractedPersonality>> {
-    let request = CompletionRequest {
-        model: model.to_string(),
-        messages: vec![Message {
-            role: Role::User,
-            content: MessageContent::Text(format!("Conversation:\n{}", conversation)),
-        }],
-        tools: vec![],
-        max_tokens: 1024,
-        temperature: 0.1,
-        system: Some(prompt.to_string()),
-        thinking: None,
-    };
-
-    let response = llm_driver
-        .complete(request)
-        .await
-        .map_err(|e| OpenFangError::LlmDriver(e.to_string()))?;
-
-    let raw = response.text();
-    let facts = parse_personality_json(&raw, category)?;
-
-    Ok(facts)
-}
-
-fn parse_personality_json(text: &str, category: &str) -> OpenFangResult<Vec<ExtractedPersonality>> {
-    let start = text.find('{').ok_or_else(|| {
-        OpenFangError::Serialization("No JSON object in personality response".to_string())
-    })?;
-    let end = text.rfind('}').map(|i| i + 1).ok_or_else(|| {
-        OpenFangError::Serialization("Malformed JSON in personality response".to_string())
-    })?;
-    if end <= start {
-        return Ok(vec![]);
-    }
-
-    let clean = &text[start..end];
-    let value: serde_json::Value = serde_json::from_str(clean)
-        .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
-
-    let key = match category {
-        "self" => "personality_facts",
-        "relationship" => "relationship_facts",
-        "user_preference" => "user_preferences",
-        _ => return Ok(vec![]),
-    };
-
-    let facts: &[serde_json::Value] = value.get(key).and_then(|v| v.as_array()).map_or(&[], |v| v.as_slice());
-
-    let personality_category = match category {
-        "self" => PersonalityCategory::Self_,
-        "relationship" => PersonalityCategory::Relationship,
-        "user_preference" => PersonalityCategory::UserPreference,
-        _ => return Ok(vec![]),
-    };
-
-    // Self facts are locked by default, others are editable
-    let locked = category == "self";
-
-    let result: Vec<ExtractedPersonality> = facts
-        .iter()
-        .filter_map(|f| f.as_str().map(|s| s.to_string()))
-        .filter(|s| !s.is_empty())
-        .map(|content| ExtractedPersonality {
-            content,
-            category: personality_category.clone(),
-            locked,
-        })
-        .collect();
-
-    Ok(result)
 }
 
 fn parse_preference_detection(text: &str) -> Option<PreferenceDetection> {
@@ -664,32 +514,5 @@ mod tests {
         assert!(text.contains("User: Hello!"));
         assert!(text.contains("Assistant: Hi there!"));
         assert!(!text.contains("System")); // System messages skipped
-    }
-
-    #[test]
-    fn test_parse_personality_json_self() {
-        let json = r#"{"personality_facts": ["I am caring", "I try to be honest"]}"#;
-        let facts = parse_personality_json(json, "self").unwrap();
-        assert_eq!(facts.len(), 2);
-        assert_eq!(facts[0].category, PersonalityCategory::Self_);
-        assert!(facts[0].locked); // Self facts are locked
-    }
-
-    #[test]
-    fn test_parse_personality_json_relationship() {
-        let json = r#"{"relationship_facts": ["We have a playful dynamic"]}"#;
-        let facts = parse_personality_json(json, "relationship").unwrap();
-        assert_eq!(facts.len(), 1);
-        assert_eq!(facts[0].category, PersonalityCategory::Relationship);
-        assert!(!facts[0].locked); // Relationship facts are editable
-    }
-
-    #[test]
-    fn test_parse_personality_json_user_preference() {
-        let json = r#"{"user_preferences": ["User prefers short answers"]}"#;
-        let facts = parse_personality_json(json, "user_preference").unwrap();
-        assert_eq!(facts.len(), 1);
-        assert_eq!(facts[0].category, PersonalityCategory::UserPreference);
-        assert!(!facts[0].locked); // User preference facts are editable
     }
 }

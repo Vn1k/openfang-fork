@@ -237,6 +237,18 @@ pub async fn run_agent_loop(
         let _ = hook_reg.fire(&ctx);
     }
 
+    // Recall personality memories selectively by category:
+    // - user_preference: always inject (max 10) — defines HOW to interact
+    // - relationship: always inject (max 5) — defines the dynamic
+    // - self: skipped from context window — AI behavior logs are useful for
+    //   consolidation dedup but don't help the AI respond better in real-time
+    let pref_memories = memory
+        .recall_personality_memories(session.agent_id, Some("user_preference"), 10)
+        .unwrap_or_default();
+    let rel_memories = memory
+        .recall_personality_memories(session.agent_id, Some("relationship"), 5)
+        .unwrap_or_default();
+
     // Build the system prompt — base prompt comes from kernel (prompt_builder),
     // we append recalled memories here since they are resolved at loop time.
     let mut system_prompt = manifest.model.system_prompt.clone();
@@ -247,6 +259,25 @@ pub async fn run_agent_loop(
             .collect();
         system_prompt.push_str("\n\n");
         system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_pairs));
+    }
+
+    // Inject personality memories into system prompt
+    if !pref_memories.is_empty() || !rel_memories.is_empty() {
+        system_prompt.push_str("\n\n## Behavioral Context");
+        system_prompt.push_str("\nThe following reflects patterns learned from previous interactions with this user.");
+
+        if !pref_memories.is_empty() {
+            system_prompt.push_str("\n\n### User Preferences");
+            for m in &pref_memories {
+                system_prompt.push_str(&format!("\n- {}", m.content));
+            }
+        }
+        if !rel_memories.is_empty() {
+            system_prompt.push_str("\n\n### Interaction Dynamic");
+            for m in &rel_memories {
+                system_prompt.push_str(&format!("\n- {}", m.content));
+            }
+        }
     }
 
     // Add the user message to session history.
@@ -1250,6 +1281,18 @@ pub async fn run_agent_loop_streaming(
         let _ = hook_reg.fire(&ctx);
     }
 
+    // Recall personality memories selectively by category:
+    // - user_preference: always inject (max 10) — defines HOW to interact
+    // - relationship: always inject (max 5) — defines the dynamic
+    // - self: skipped from context window — AI behavior logs are useful for
+    //   consolidation dedup but don't help the AI respond better in real-time
+    let pref_memories = memory
+        .recall_personality_memories(session.agent_id, Some("user_preference"), 10)
+        .unwrap_or_default();
+    let rel_memories = memory
+        .recall_personality_memories(session.agent_id, Some("relationship"), 5)
+        .unwrap_or_default();
+
     // Build the system prompt — base prompt comes from kernel (prompt_builder),
     // we append recalled memories here since they are resolved at loop time.
     let mut system_prompt = manifest.model.system_prompt.clone();
@@ -1260,6 +1303,25 @@ pub async fn run_agent_loop_streaming(
             .collect();
         system_prompt.push_str("\n\n");
         system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_pairs));
+    }
+
+    // Inject personality memories into system prompt
+    if !pref_memories.is_empty() || !rel_memories.is_empty() {
+        system_prompt.push_str("\n\n## Behavioral Context");
+        system_prompt.push_str("\nThe following reflects patterns learned from previous interactions with this user.");
+
+        if !pref_memories.is_empty() {
+            system_prompt.push_str("\n\n### User Preferences");
+            for m in &pref_memories {
+                system_prompt.push_str(&format!("\n- {}", m.content));
+            }
+        }
+        if !rel_memories.is_empty() {
+            system_prompt.push_str("\n\n### Interaction Dynamic");
+            for m in &rel_memories {
+                system_prompt.push_str(&format!("\n- {}", m.content));
+            }
+        }
     }
 
     // Add the user message to session history.

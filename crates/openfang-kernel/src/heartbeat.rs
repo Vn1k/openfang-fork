@@ -143,13 +143,33 @@ pub fn check_agents(registry: &AgentRegistry, config: &HeartbeatConfig) -> Vec<H
 
         let inactive_secs = (now - entry_ref.last_active).num_seconds();
 
-        // Determine timeout: use agent's autonomous config if set, else default
-        let timeout_secs = entry_ref
-            .manifest
-            .autonomous
-            .as_ref()
-            .map(|a| a.heartbeat_interval_secs * UNRESPONSIVE_MULTIPLIER)
-            .unwrap_or(config.default_timeout_secs) as i64;
+        // Determine timeout for unresponsiveness detection.
+        //
+        // IMPORTANT: Only use the agent's heartbeat_interval_secs if the agent
+        // is running in Continuous or Periodic schedule mode (true background agents).
+        //
+        // Conversational agents (Reactive schedule) that happen to have an
+        // [autonomous] config section should use the default timeout — otherwise
+        // a 30s heartbeat_interval causes them to be marked Crashed after just
+        // 60s of user inactivity, triggering spurious recovery cycles and
+        // background API calls with the full session context (24K+ tokens).
+        use openfang_types::agent::ScheduleMode;
+        let is_background_agent = matches!(
+            entry_ref.manifest.schedule,
+            ScheduleMode::Continuous { .. } | ScheduleMode::Periodic { .. }
+        );
+        let timeout_secs = if is_background_agent {
+            entry_ref
+                .manifest
+                .autonomous
+                .as_ref()
+                .map(|a| a.heartbeat_interval_secs * UNRESPONSIVE_MULTIPLIER)
+                .unwrap_or(config.default_timeout_secs)
+        } else {
+            // Reactive/Proactive agents: always use the default timeout
+            // regardless of autonomous config
+            config.default_timeout_secs
+        } as i64;
 
         // Crashed agents are always considered unresponsive
         let unresponsive = entry_ref.state == AgentState::Crashed || inactive_secs > timeout_secs;

@@ -528,6 +528,7 @@ impl MemorySubstrate {
         locked: bool,
         extraction_trigger: &str,
         metadata: serde_json::Value,
+        embedding: Option<Vec<f32>>,
     ) -> OpenFangResult<MemoryId> {
         let conn = Arc::clone(&self.conn);
         let content = content.to_string();
@@ -538,10 +539,16 @@ impl MemorySubstrate {
             let conn = conn.lock().map_err(|e| OpenFangError::Internal(e.to_string()))?;
             let id = uuid::Uuid::new_v4();
             let now = chrono::Utc::now().to_rfc3339();
+
+            // Serialize embedding to bytes if provided
+            let embedding_blob: Option<Vec<u8>> = embedding.map(|v| {
+                v.iter().flat_map(|f| f.to_le_bytes()).collect()
+            });
+
             conn.execute(
                 "INSERT INTO personality_memories
-                 (id, agent_id, content, category, locked, extraction_trigger, metadata, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+                 (id, agent_id, content, category, locked, extraction_trigger, metadata, embedding, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
                 rusqlite::params![
                     id.to_string(),
                     agent_id.0.to_string(),
@@ -550,6 +557,7 @@ impl MemorySubstrate {
                     locked as i32,
                     extraction_trigger,
                     metadata.to_string(),
+                    embedding_blob,
                     now,
                 ],
             )
@@ -628,6 +636,17 @@ impl MemorySubstrate {
         id: &str,
         new_content: &str,
     ) -> OpenFangResult<bool> {
+        self.update_personality_memory_with_embedding(id, new_content, None)
+    }
+
+    /// Update content and optionally re-embed a personality memory.
+    /// Only non-locked memories can be updated.
+    pub fn update_personality_memory_with_embedding(
+        &self,
+        id: &str,
+        new_content: &str,
+        embedding: Option<Vec<f32>>,
+    ) -> OpenFangResult<bool> {
         let conn = self
             .conn
             .lock()
@@ -643,10 +662,21 @@ impl MemorySubstrate {
             return Ok(false);
         }
         let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE personality_memories SET content = ?1, updated_at = ?2 WHERE id = ?3",
-            rusqlite::params![new_content, now, id],
-        )
+        match embedding {
+            Some(v) => {
+                let blob: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+                conn.execute(
+                    "UPDATE personality_memories SET content = ?1, embedding = ?2, updated_at = ?3 WHERE id = ?4",
+                    rusqlite::params![new_content, blob, now, id],
+                )
+            }
+            None => {
+                conn.execute(
+                    "UPDATE personality_memories SET content = ?1, updated_at = ?2 WHERE id = ?3",
+                    rusqlite::params![new_content, now, id],
+                )
+            }
+        }
         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         Ok(true)
     }

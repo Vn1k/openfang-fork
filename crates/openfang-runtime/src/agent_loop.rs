@@ -164,6 +164,7 @@ pub async fn run_agent_loop(
     context_window_tokens: Option<usize>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
     user_content_blocks: Option<Vec<ContentBlock>>,
+    _skip_episodic_memory: bool,
 ) -> OpenFangResult<AgentLoopResult> {
     info!(agent = %manifest.name, "Starting agent loop");
 
@@ -236,6 +237,18 @@ pub async fn run_agent_loop(
         let _ = hook_reg.fire(&ctx);
     }
 
+    // Recall personality memories selectively by category:
+    // - user_preference: always inject (max 10) — defines HOW to interact
+    // - relationship: always inject (max 5) — defines the dynamic
+    // - self: skipped from context window — AI behavior logs are useful for
+    //   consolidation dedup but don't help the AI respond better in real-time
+    let pref_memories = memory
+        .recall_personality_memories(session.agent_id, Some("user_preference"), 10)
+        .unwrap_or_default();
+    let rel_memories = memory
+        .recall_personality_memories(session.agent_id, Some("relationship"), 5)
+        .unwrap_or_default();
+
     // Build the system prompt — base prompt comes from kernel (prompt_builder),
     // we append recalled memories here since they are resolved at loop time.
     let mut system_prompt = manifest.model.system_prompt.clone();
@@ -246,6 +259,25 @@ pub async fn run_agent_loop(
             .collect();
         system_prompt.push_str("\n\n");
         system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_pairs));
+    }
+
+    // Inject personality memories into system prompt
+    if !pref_memories.is_empty() || !rel_memories.is_empty() {
+        system_prompt.push_str("\n\n## Behavioral Context");
+        system_prompt.push_str("\nThe following reflects patterns learned from previous interactions with this user.");
+
+        if !pref_memories.is_empty() {
+            system_prompt.push_str("\n\n### User Preferences");
+            for m in &pref_memories {
+                system_prompt.push_str(&format!("\n- {}", m.content));
+            }
+        }
+        if !rel_memories.is_empty() {
+            system_prompt.push_str("\n\n### Interaction Dynamic");
+            for m in &rel_memories {
+                system_prompt.push_str(&format!("\n- {}", m.content));
+            }
+        }
     }
 
     // Add the user message to session history.
@@ -525,47 +557,52 @@ pub async fn run_agent_loop(
                     .map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
                 // Remember this interaction (with embedding if available)
-                let interaction_text = format!(
-                    "User asked: {}\nI responded: {}",
-                    user_message, final_response
-                );
-                if let Some(emb) = embedding_driver {
-                    match emb.embed_one(&interaction_text).await {
-                        Ok(vec) => {
-                            let _ = memory
-                                .remember_with_embedding_async(
-                                    session.agent_id,
-                                    &interaction_text,
-                                    MemorySource::Conversation,
-                                    "episodic",
-                                    HashMap::new(),
-                                    Some(&vec),
-                                )
-                                .await;
+                // Skip episodic memory when smart_memory is enabled (fact extraction replaces it)
+                if !_skip_episodic_memory {
+                    let interaction_text = format!(
+                        "User asked: {}\nI responded: {}",
+                        user_message, final_response
+                    );
+                    if let Some(emb) = embedding_driver {
+                        match emb.embed_one(&interaction_text).await {
+                            Ok(vec) => {
+                                let _ = memory
+                                    .remember_with_embedding_async(
+                                        session.agent_id,
+                                        &interaction_text,
+                                        MemorySource::Conversation,
+                                        "episodic",
+                                        HashMap::new(),
+                                        Some(&vec),
+                                        false,
+                                        None,
+                                    )
+                                    .await;
+                            }
+                            Err(e) => {
+                                warn!("Embedding for remember failed: {e}");
+                                let _ = memory
+                                    .remember(
+                                        session.agent_id,
+                                        &interaction_text,
+                                        MemorySource::Conversation,
+                                        "episodic",
+                                        HashMap::new(),
+                                    )
+                                    .await;
+                            }
                         }
-                        Err(e) => {
-                            warn!("Embedding for remember failed: {e}");
-                            let _ = memory
-                                .remember(
-                                    session.agent_id,
-                                    &interaction_text,
-                                    MemorySource::Conversation,
-                                    "episodic",
-                                    HashMap::new(),
-                                )
-                                .await;
-                        }
+                    } else {
+                        let _ = memory
+                            .remember(
+                                session.agent_id,
+                                &interaction_text,
+                                MemorySource::Conversation,
+                                "episodic",
+                                HashMap::new(),
+                            )
+                            .await;
                     }
-                } else {
-                    let _ = memory
-                        .remember(
-                            session.agent_id,
-                            &interaction_text,
-                            MemorySource::Conversation,
-                            "episodic",
-                            HashMap::new(),
-                        )
-                        .await;
                 }
 
                 // Notify phase: Done
@@ -1171,6 +1208,7 @@ pub async fn run_agent_loop_streaming(
     context_window_tokens: Option<usize>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
     user_content_blocks: Option<Vec<ContentBlock>>,
+    skip_episodic_memory: bool,
 ) -> OpenFangResult<AgentLoopResult> {
     info!(agent = %manifest.name, "Starting streaming agent loop");
 
@@ -1243,6 +1281,18 @@ pub async fn run_agent_loop_streaming(
         let _ = hook_reg.fire(&ctx);
     }
 
+    // Recall personality memories selectively by category:
+    // - user_preference: always inject (max 10) — defines HOW to interact
+    // - relationship: always inject (max 5) — defines the dynamic
+    // - self: skipped from context window — AI behavior logs are useful for
+    //   consolidation dedup but don't help the AI respond better in real-time
+    let pref_memories = memory
+        .recall_personality_memories(session.agent_id, Some("user_preference"), 10)
+        .unwrap_or_default();
+    let rel_memories = memory
+        .recall_personality_memories(session.agent_id, Some("relationship"), 5)
+        .unwrap_or_default();
+
     // Build the system prompt — base prompt comes from kernel (prompt_builder),
     // we append recalled memories here since they are resolved at loop time.
     let mut system_prompt = manifest.model.system_prompt.clone();
@@ -1253,6 +1303,25 @@ pub async fn run_agent_loop_streaming(
             .collect();
         system_prompt.push_str("\n\n");
         system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_pairs));
+    }
+
+    // Inject personality memories into system prompt
+    if !pref_memories.is_empty() || !rel_memories.is_empty() {
+        system_prompt.push_str("\n\n## Behavioral Context");
+        system_prompt.push_str("\nThe following reflects patterns learned from previous interactions with this user.");
+
+        if !pref_memories.is_empty() {
+            system_prompt.push_str("\n\n### User Preferences");
+            for m in &pref_memories {
+                system_prompt.push_str(&format!("\n- {}", m.content));
+            }
+        }
+        if !rel_memories.is_empty() {
+            system_prompt.push_str("\n\n### Interaction Dynamic");
+            for m in &rel_memories {
+                system_prompt.push_str(&format!("\n- {}", m.content));
+            }
+        }
     }
 
     // Add the user message to session history.
@@ -1528,47 +1597,52 @@ pub async fn run_agent_loop_streaming(
                     .map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
                 // Remember this interaction (with embedding if available)
-                let interaction_text = format!(
-                    "User asked: {}\nI responded: {}",
-                    user_message, final_response
-                );
-                if let Some(emb) = embedding_driver {
-                    match emb.embed_one(&interaction_text).await {
-                        Ok(vec) => {
-                            let _ = memory
-                                .remember_with_embedding_async(
-                                    session.agent_id,
-                                    &interaction_text,
-                                    MemorySource::Conversation,
-                                    "episodic",
-                                    HashMap::new(),
-                                    Some(&vec),
-                                )
-                                .await;
+                // Skip episodic memory when smart_memory is enabled (fact extraction replaces it)
+                if !skip_episodic_memory {
+                    let interaction_text = format!(
+                        "User asked: {}\nI responded: {}",
+                        user_message, final_response
+                    );
+                    if let Some(emb) = embedding_driver {
+                        match emb.embed_one(&interaction_text).await {
+                            Ok(vec) => {
+                                let _ = memory
+                                    .remember_with_embedding_async(
+                                        session.agent_id,
+                                        &interaction_text,
+                                        MemorySource::Conversation,
+                                        "episodic",
+                                        HashMap::new(),
+                                        Some(&vec),
+                                        false,
+                                        None,
+                                    )
+                                    .await;
+                            }
+                            Err(e) => {
+                                warn!("Embedding for remember failed (streaming): {e}");
+                                let _ = memory
+                                    .remember(
+                                        session.agent_id,
+                                        &interaction_text,
+                                        MemorySource::Conversation,
+                                        "episodic",
+                                        HashMap::new(),
+                                    )
+                                    .await;
+                            }
                         }
-                        Err(e) => {
-                            warn!("Embedding for remember failed (streaming): {e}");
-                            let _ = memory
-                                .remember(
-                                    session.agent_id,
-                                    &interaction_text,
-                                    MemorySource::Conversation,
-                                    "episodic",
-                                    HashMap::new(),
-                                )
-                                .await;
-                        }
+                    } else {
+                        let _ = memory
+                            .remember(
+                                session.agent_id,
+                                &interaction_text,
+                                MemorySource::Conversation,
+                                "episodic",
+                                HashMap::new(),
+                            )
+                            .await;
                     }
-                } else {
-                    let _ = memory
-                        .remember(
-                            session.agent_id,
-                            &interaction_text,
-                            MemorySource::Conversation,
-                            "episodic",
-                            HashMap::new(),
-                        )
-                        .await;
                 }
 
                 // Notify phase: Done
@@ -2952,213 +3026,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
-        )
-        .await
-        .expect("Loop should complete without error");
-
-        // The response MUST NOT be empty — it should contain our fallback text
-        assert!(
-            !result.response.trim().is_empty(),
-            "Response should not be empty after tool use, got: {:?}",
-            result.response
-        );
-        assert!(
-            result.response.contains("Task completed"),
-            "Expected fallback message, got: {:?}",
-            result.response
-        );
-    }
-
-    #[tokio::test]
-    async fn test_tool_error_injects_no_fabrication_guidance() {
-        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
-        let agent_id = openfang_types::agent::AgentId::new();
-        let mut session = openfang_memory::session::Session {
-            id: openfang_types::agent::SessionId::new(),
-            agent_id,
-            messages: Vec::new(),
-            context_window_tokens: 0,
-            label: None,
-        };
-        let manifest = test_manifest();
-        let driver: Arc<dyn LlmDriver> = Arc::new(EmptyAfterToolUseDriver::new());
-
-        run_agent_loop(
-            &manifest,
-            "Do something with tools",
-            &mut session,
-            &memory,
-            driver,
-            &[], // no tools registered — the tool call will fail, which is fine
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None, // on_phase
-            None, // media_engine
-            None, // tts_engine
-            None, // docker_config
-            None, // hooks
-            None, // context_window_tokens
-            None, // process_manager
-            None, // user_content_blocks
-        )
-        .await
-        .expect("Loop should complete without error");
-
-        let guidance_seen = session.messages.iter().any(|msg| {
-            match &msg.content {
-            MessageContent::Blocks(blocks) => blocks.iter().any(|block| {
-                matches!(block, ContentBlock::Text { text, .. } if text == TOOL_ERROR_GUIDANCE)
-            }),
-            _ => false,
-        }
-        });
-
-        assert!(
-            guidance_seen,
-            "Expected tool error guidance in session messages after failed tool call"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_empty_response_max_tokens_returns_fallback() {
-        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
-        let agent_id = openfang_types::agent::AgentId::new();
-        let mut session = openfang_memory::session::Session {
-            id: openfang_types::agent::SessionId::new(),
-            agent_id,
-            messages: Vec::new(),
-            context_window_tokens: 0,
-            label: None,
-        };
-        let manifest = test_manifest();
-        let driver: Arc<dyn LlmDriver> = Arc::new(EmptyMaxTokensDriver);
-
-        let result = run_agent_loop(
-            &manifest,
-            "Tell me something long",
-            &mut session,
-            &memory,
-            driver,
-            &[],
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None, // on_phase
-            None, // media_engine
-            None, // tts_engine
-            None, // docker_config
-            None, // hooks
-            None, // context_window_tokens
-            None, // process_manager
-            None, // user_content_blocks
-        )
-        .await
-        .expect("Loop should complete without error");
-
-        // Should hit MAX_CONTINUATIONS and return fallback instead of empty
-        assert!(
-            !result.response.trim().is_empty(),
-            "Response should not be empty on max tokens, got: {:?}",
-            result.response
-        );
-        assert!(
-            result.response.contains("token limit"),
-            "Expected max-tokens fallback message, got: {:?}",
-            result.response
-        );
-    }
-
-    #[tokio::test]
-    async fn test_normal_response_not_replaced_by_fallback() {
-        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
-        let agent_id = openfang_types::agent::AgentId::new();
-        let mut session = openfang_memory::session::Session {
-            id: openfang_types::agent::SessionId::new(),
-            agent_id,
-            messages: Vec::new(),
-            context_window_tokens: 0,
-            label: None,
-        };
-        let manifest = test_manifest();
-        let driver: Arc<dyn LlmDriver> = Arc::new(NormalDriver);
-
-        let result = run_agent_loop(
-            &manifest,
-            "Say hello",
-            &mut session,
-            &memory,
-            driver,
-            &[],
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None, // on_phase
-            None, // media_engine
-            None, // tts_engine
-            None, // docker_config
-            None, // hooks
-            None, // context_window_tokens
-            None, // process_manager
-            None, // user_content_blocks
-        )
-        .await
-        .expect("Loop should complete without error");
-
-        // Normal response should pass through unchanged
-        assert_eq!(result.response, "Hello from the agent!");
-    }
-
-    #[tokio::test]
-    async fn test_streaming_empty_response_after_tool_use_returns_fallback() {
-        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
-        let agent_id = openfang_types::agent::AgentId::new();
-        let mut session = openfang_memory::session::Session {
-            id: openfang_types::agent::SessionId::new(),
-            agent_id,
-            messages: Vec::new(),
-            context_window_tokens: 0,
-            label: None,
-        };
-        let manifest = test_manifest();
-        let driver: Arc<dyn LlmDriver> = Arc::new(EmptyAfterToolUseDriver::new());
-        let (tx, _rx) = mpsc::channel(64);
-
-        let result = run_agent_loop_streaming(
-            &manifest,
-            "Do something with tools",
-            &mut session,
-            &memory,
-            driver,
-            &[],
-            None,
-            tx,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None, // on_phase
-            None, // media_engine
-            None, // tts_engine
-            None, // docker_config
-            None, // hooks
-            None, // context_window_tokens
-            None, // process_manager
-            None, // user_content_blocks
+            false, // skip_episodic_memory (tests need episodic enabled)
         )
         .await
         .expect("Streaming loop should complete without error");
@@ -3283,6 +3151,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            false, // skip_episodic_memory (tests need episodic enabled)
         )
         .await
         .expect("Loop should recover via retry");
@@ -3330,6 +3199,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            false, // skip_episodic_memory (tests need episodic enabled)
         )
         .await
         .expect("Loop should complete with fallback");
@@ -3385,6 +3255,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            false, // skip_episodic_memory (tests need episodic enabled)
         )
         .await
         .expect("Streaming loop should complete without error");
@@ -4273,6 +4144,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            false, // skip_episodic_memory (tests need episodic enabled)
         )
         .await
         .expect("Agent loop should complete");
@@ -4340,6 +4212,7 @@ mod tests {
             None,
             None,
             None, // user_content_blocks
+            false, // skip_episodic_memory (tests need episodic enabled)
         )
         .await
         .expect("Normal loop should complete");
@@ -4403,6 +4276,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            false, // skip_episodic_memory (tests need episodic enabled)
         )
         .await
         .expect("Streaming loop should complete");

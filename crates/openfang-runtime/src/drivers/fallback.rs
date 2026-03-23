@@ -19,8 +19,6 @@ pub struct FallbackDriver {
 
 impl FallbackDriver {
     /// Create a new fallback driver from an ordered chain of (driver, model_name) pairs.
-    ///
-    /// The first entry is the primary; subsequent are fallbacks.
     pub fn new(drivers: Vec<Arc<dyn LlmDriver>>) -> Self {
         Self {
             drivers: drivers.into_iter().map(|d| (d, String::new())).collect(),
@@ -32,6 +30,10 @@ impl FallbackDriver {
         Self { drivers }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LlmDriver impl — complete() only
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[async_trait]
 impl LlmDriver for FallbackDriver {
@@ -114,6 +116,10 @@ impl LlmDriver for FallbackDriver {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,33 +127,22 @@ mod tests {
     use openfang_types::message::{ContentBlock, StopReason, TokenUsage};
 
     struct FailDriver;
-
     #[async_trait]
     impl LlmDriver for FailDriver {
         async fn complete(&self, _req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
-            Err(LlmError::Api {
-                status: 500,
-                message: "Internal error".to_string(),
-            })
+            Err(LlmError::Api { status: 500, message: "Internal error".to_string() })
         }
     }
 
     struct OkDriver;
-
     #[async_trait]
     impl LlmDriver for OkDriver {
         async fn complete(&self, _req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
             Ok(CompletionResponse {
-                content: vec![ContentBlock::Text {
-                    text: "OK".to_string(),
-                    provider_metadata: None,
-                }],
+                content: vec![ContentBlock::Text { text: "OK".to_string(), provider_metadata: None }],
                 stop_reason: StopReason::EndTurn,
                 tool_calls: vec![],
-                usage: TokenUsage {
-                    input_tokens: 10,
-                    output_tokens: 5,
-                },
+                usage: TokenUsage { input_tokens: 10, output_tokens: 5 },
             })
         }
     }
@@ -181,8 +176,7 @@ mod tests {
             Arc::new(FailDriver) as Arc<dyn LlmDriver>,
             Arc::new(OkDriver) as Arc<dyn LlmDriver>,
         ]);
-        let result = driver.complete(test_request()).await;
-        assert!(result.is_ok());
+        assert!(driver.complete(test_request()).await.is_ok());
     }
 
     #[tokio::test]
@@ -191,32 +185,23 @@ mod tests {
             Arc::new(FailDriver) as Arc<dyn LlmDriver>,
             Arc::new(FailDriver) as Arc<dyn LlmDriver>,
         ]);
-        let result = driver.complete(test_request()).await;
-        assert!(result.is_err());
+        assert!(driver.complete(test_request()).await.is_err());
     }
 
     #[tokio::test]
     async fn test_rate_limit_falls_through() {
         struct RateLimitDriver;
-
         #[async_trait]
         impl LlmDriver for RateLimitDriver {
-            async fn complete(
-                &self,
-                _req: CompletionRequest,
-            ) -> Result<CompletionResponse, LlmError> {
-                Err(LlmError::RateLimited {
-                    retry_after_ms: 5000,
-                })
+            async fn complete(&self, _req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+                Err(LlmError::RateLimited { retry_after_ms: 5000 })
             }
         }
-
         let driver = FallbackDriver::new(vec![
             Arc::new(RateLimitDriver) as Arc<dyn LlmDriver>,
             Arc::new(OkDriver) as Arc<dyn LlmDriver>,
         ]);
         let result = driver.complete(test_request()).await;
-        // Rate limit should fall through to the OkDriver fallback
         assert!(result.is_ok());
         assert_eq!(result.unwrap().text(), "OK");
     }
@@ -224,25 +209,17 @@ mod tests {
     #[tokio::test]
     async fn test_rate_limit_all_fail() {
         struct RateLimitDriver;
-
         #[async_trait]
         impl LlmDriver for RateLimitDriver {
-            async fn complete(
-                &self,
-                _req: CompletionRequest,
-            ) -> Result<CompletionResponse, LlmError> {
-                Err(LlmError::RateLimited {
-                    retry_after_ms: 5000,
-                })
+            async fn complete(&self, _req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+                Err(LlmError::RateLimited { retry_after_ms: 5000 })
             }
         }
-
         let driver = FallbackDriver::new(vec![
             Arc::new(RateLimitDriver) as Arc<dyn LlmDriver>,
             Arc::new(RateLimitDriver) as Arc<dyn LlmDriver>,
         ]);
         let result = driver.complete(test_request()).await;
-        // All drivers rate-limited — error should bubble up
         assert!(matches!(result, Err(LlmError::RateLimited { .. })));
     }
 }

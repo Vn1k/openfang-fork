@@ -1467,6 +1467,31 @@ impl Default for DefaultModelConfig {
     }
 }
 
+/// LLM configuration for memory operations (fact extraction and memory decision).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryLlmConfig {
+    /// Provider name (e.g., "openai", "anthropic", "groq", "ollama").
+    /// If None, falls back to the agent's own LLM.
+    pub provider: Option<String>,
+    /// Model name (e.g., "gpt-4o-mini", "claude-3-haiku-20250514", "llama-3.1-8b-instant").
+    /// If None, falls back to the agent's own model.
+    pub model: Option<String>,
+    /// Environment variable name for the API key.
+    /// If None, uses the provider's default env var (e.g., OPENAI_API_KEY).
+    pub api_key_env: Option<String>,
+}
+
+impl Default for MemoryLlmConfig {
+    fn default() -> Self {
+        Self {
+            provider: None,
+            model: None,
+            api_key_env: None,
+        }
+    }
+}
+
 /// Memory substrate configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1488,6 +1513,73 @@ pub struct MemoryConfig {
     /// How often to run memory consolidation (hours). 0 = disabled.
     #[serde(default = "default_consolidation_interval")]
     pub consolidation_interval_hours: u64,
+
+    /// Enable mem0-style LLM fact extraction and consolidation.
+    /// When true, memories are extracted as discrete facts and
+    /// deduplicated/updated intelligently. Adds ~1-2 LLM calls per turn.
+    #[serde(default)]
+    pub smart_memory_enabled: bool,
+
+    /// Only run smart memory extraction every N turns (0 = every turn).
+    /// Reduces LLM cost at expense of memory freshness.
+    #[serde(default)]
+    pub smart_memory_interval: usize,
+
+    /// LLM for extracting facts from conversation.
+    /// If not configured, falls back to the agent's own LLM.
+    #[serde(default)]
+    pub fact_extraction_llm: MemoryLlmConfig,
+
+    /// LLM for deciding add/replace/delete actions during consolidation.
+    /// If not configured, falls back to the agent's own LLM.
+    #[serde(default)]
+    pub memory_decision_llm: MemoryLlmConfig,
+
+    /// Personality configuration for emergent personality through memory.
+    #[serde(default)]
+    pub personality: PersonalityConfig,
+}
+
+/// Configuration for emergent personality through memory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PersonalityConfig {
+    /// LLM for personality extraction and implicit preference detection.
+    /// Recommended: a capable but cheap model like gpt-4o-mini.
+    /// If not configured, falls back to the agent's own LLM.
+    pub personality_llm: MemoryLlmConfig,
+
+    /// Run full personality extraction every N conversations (0 = disabled).
+    /// Periodic extraction captures longer-term patterns across many exchanges.
+    #[serde(default = "default_personality_extraction_interval")]
+    pub extraction_interval: usize,
+
+    /// Enable implicit preference detection on every turn (or every N turns).
+    /// When true, the LLM scans recent messages for behavioral signals
+    /// without requiring explicit keywords from the user.
+    /// Default: true
+    #[serde(default = "default_true")]
+    pub implicit_detection_enabled: bool,
+
+    /// Run implicit preference detection every N turns (1 = every turn).
+    /// Increase to reduce LLM calls at the cost of detection latency.
+    /// Recommended: 1-3. Default: 1.
+    #[serde(default = "default_implicit_detection_interval")]
+    pub implicit_detection_interval: usize,
+}
+
+fn default_personality_extraction_interval() -> usize { 5 }
+fn default_implicit_detection_interval() -> usize { 1 }
+
+impl Default for PersonalityConfig {
+    fn default() -> Self {
+        Self {
+            personality_llm: MemoryLlmConfig::default(),
+            extraction_interval: 5,
+            implicit_detection_enabled: true,
+            implicit_detection_interval: 1,
+        }
+    }
 }
 
 fn default_consolidation_interval() -> u64 {
@@ -1504,6 +1596,11 @@ impl Default for MemoryConfig {
             embedding_provider: None,
             embedding_api_key_env: None,
             consolidation_interval_hours: default_consolidation_interval(),
+            smart_memory_enabled: false,
+            smart_memory_interval: 3,
+            fact_extraction_llm: MemoryLlmConfig::default(),
+            memory_decision_llm: MemoryLlmConfig::default(),
+            personality: PersonalityConfig::default(),
         }
     }
 }

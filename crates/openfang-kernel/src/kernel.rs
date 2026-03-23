@@ -29,10 +29,10 @@ use openfang_runtime::sandbox::{SandboxConfig, WasmSandbox};
 use openfang_runtime::tool_runner::builtin_tool_definitions;
 use openfang_types::agent::*;
 use openfang_types::capability::Capability;
-use openfang_types::config::{KernelConfig, OutputFormat};
+use openfang_types::config::{KernelConfig, OutputFormat, PersonalityConfig};
 use openfang_types::error::OpenFangError;
 use openfang_types::event::*;
-use openfang_types::memory::Memory;
+use openfang_types::memory::{Memory, PersonalityCategory};
 use openfang_types::tool::ToolDefinition;
 
 use async_trait::async_trait;
@@ -425,6 +425,193 @@ fn generate_identity_files(workspace: &Path, manifest: &AgentManifest) {
             }
         }
     }
+}
+
+/// Emergent personality extraction — background task.
+///
+/// Runs personality memory extraction after agent conversation.
+/// Checks both periodic trigger (every N conversations) and explicit preference detection.
+async fn run_personality_extraction(
+    agent_id: AgentId,
+    session_id: SessionId,
+    memory: &Arc<MemorySubstrate>,
+    llm_driver: Arc<dyn LlmDriver>,
+    model: &str,
+    personality_config: &PersonalityConfig,
+    embedding_driver: Option<Arc<dyn openfang_types::driver::embedding::EmbeddingDriver + Send + Sync>>,
+) -> KernelResult<()> {
+    use openfang_memory::personality::{consolidate_personality, detect_preference, extract_personality, should_extract_periodic, ExistingPersonalityMemory, ExtractionTrigger, PersonalityAction};
+
+    let session = memory.get_session(session_id).map_err(KernelError::OpenFang)?;
+    let messages = match session {
+        Some(s) => s.messages,
+        None => return Ok(()),
+    };
+
+    if messages.is_empty() {
+        return Ok(());
+    }
+
+    let conversation_count = messages.len() / 2;
+
+    // Periodic trigger takes priority — if it's time for periodic extraction, run it.
+    // Otherwise, always run implicit preference detection on recent messages.
+    // No keyword gate — LLM decides whether there is a signal worth acting on.
+    let trigger = if personality_config.extraction_interval > 0
+        && should_extract_periodic(conversation_count, personality_config.extraction_interval)
+    {
+        tracing::info!(
+            agent_id = %agent_id,
+            conversation_count,
+            interval = personality_config.extraction_interval,
+            "Personality periodic trigger fired"
+        );
+        Some(ExtractionTrigger::Periodic)
+    } else if personality_config.implicit_detection_enabled {
+        // Throttle: only run implicit detection every N turns
+        let implicit_interval = personality_config.implicit_detection_interval.max(1);
+        let should_detect = conversation_count % implicit_interval == 0;
+
+        tracing::debug!(
+            agent_id = %agent_id,
+            conversation_count,
+            implicit_interval,
+            should_detect,
+            "Personality implicit detection check"
+        );
+
+        if should_detect {
+            tracing::info!(
+                agent_id = %agent_id,
+                model,
+                "Running implicit preference detection"
+            );
+            match detect_preference(
+                &messages,
+                llm_driver.as_ref(),
+                model,
+            ).await {
+                Ok(Some((t, summary))) => {
+                    tracing::info!(
+                        agent_id = %agent_id,
+                        trigger = ?t,
+                        summary = %summary,
+                        "Implicit preference signal detected"
+                    );
+                    Some(t)
+                },
+                Ok(None) => {
+                    tracing::info!(agent_id = %agent_id, "No preference signal detected this turn");
+                    None
+                },
+                Err(e) => {
+                    tracing::warn!(agent_id = %agent_id, "Implicit preference detection failed: {e}");
+                    None
+                }
+            }
+        } else {
+            tracing::debug!(
+                agent_id = %agent_id,
+                conversation_count,
+                implicit_interval,
+                "Implicit detection skipped (throttle)"
+            );
+            None
+        }
+    } else {
+        None
+    };
+
+    let trigger = match trigger {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+
+    let extraction_trigger_str = match trigger {
+        ExtractionTrigger::Periodic => "periodic",
+        ExtractionTrigger::ExplicitPreference => "explicit_preference",
+        ExtractionTrigger::ImplicitPreference => "implicit_preference",
+    };
+
+    let extracted = extract_personality(&messages, trigger.clone(), llm_driver.as_ref(), model)
+        .await
+        .map_err(|e| KernelError::OpenFang(e))?;
+
+    if extracted.is_empty() {
+        return Ok(());
+    }
+
+    // ── Load existing personality memories for consolidation ────────────────
+    // We load all non-deleted memories for this agent to pass to the LLM.
+    // Personality memories are few enough (< 100 typically) that loading all
+    // is cheaper than doing per-fact embedding similarity queries.
+    let existing_raw = memory
+        .recall_personality_memories(agent_id, None, 200)
+        .map_err(KernelError::OpenFang)?;
+
+    let existing: Vec<ExistingPersonalityMemory> = existing_raw.iter()
+        .map(|m| ExistingPersonalityMemory {
+            id: m.id.clone(),
+            content: m.content.clone(),
+            locked: m.locked,
+        })
+        .collect();
+
+    // ── Consolidate: deduplicate new facts against existing memories ──────────
+    let consolidation = consolidate_personality(
+        extracted,
+        existing,
+        llm_driver.as_ref(),
+        model,
+    ).await.map_err(|e| KernelError::OpenFang(e))?;
+
+    tracing::info!(
+        agent_id = %agent_id,
+        facts_processed = consolidation.facts_processed,
+        existing_checked = consolidation.existing_checked,
+        actions = consolidation.actions.len(),
+        "Personality consolidation complete"
+    );
+
+    // ── Execute consolidation actions ─────────────────────────────────────────
+    for action in consolidation.actions {
+        match action {
+            PersonalityAction::Add { text, category, locked } => {
+                let category_str = match category {
+                    PersonalityCategory::Self_ => "self",
+                    PersonalityCategory::Relationship => "relationship",
+                    PersonalityCategory::UserPreference => "user_preference",
+                };
+                let metadata = serde_json::json!({
+                    "extraction_trigger": extraction_trigger_str,
+                    "category": category_str,
+                });
+                // Embed the content if embedding driver is available
+                let embedding = match &embedding_driver {
+                    Some(drv) => drv.embed_one(&text).await.ok(),
+                    None => None,
+                };
+                let _ = memory.save_personality_memory_async(
+                    agent_id, &text, category_str, locked,
+                    extraction_trigger_str, metadata, embedding,
+                ).await;
+            }
+            PersonalityAction::Update { memory_id, text, .. } => {
+                // Re-embed on update so vector stays in sync with new content
+                let embedding = match &embedding_driver {
+                    Some(drv) => drv.embed_one(&text).await.ok().map(|v| v),
+                    None => None,
+                };
+                let _ = memory.update_personality_memory_with_embedding(&memory_id, &text, embedding);
+            }
+            PersonalityAction::Delete { memory_id } => {
+                let _ = memory.delete_personality_memory(&memory_id);
+            }
+            PersonalityAction::None => {}
+        }
+    }
+
+    Ok(())
 }
 
 /// Append an assistant response summary to the daily memory log (best-effort, append-only).
@@ -1932,7 +2119,7 @@ impl OpenFangKernel {
                         warn!(agent_id = %agent_id, "Failed to load workspace skills (streaming): {e}");
                     }
                 }
-            }
+            } 
 
             // Create a phase callback that emits PhaseChange events to WS/SSE clients
             let phase_tx = tx.clone();
@@ -1986,6 +2173,7 @@ impl OpenFangKernel {
                 ctx_window,
                 Some(&kernel_clone.process_manager),
                 content_blocks,
+                kernel_clone.config.memory.smart_memory_enabled,
             )
             .await;
 
@@ -2044,6 +2232,131 @@ impl OpenFangKernel {
                     let _ = kernel_clone
                         .registry
                         .set_state(agent_id, AgentState::Running);
+
+                    // mem0-style smart memory update (non-blocking background task)
+                    if kernel_clone.config.memory.smart_memory_enabled {
+                        // smart_memory_interval: 0 = every turn, N = every N turns
+                        let sm_interval = kernel_clone.config.memory.smart_memory_interval;
+                        // Count only user messages — session.messages includes both user and
+                        // assistant turns, so messages.len() is always even and % sm_interval
+                        // would fire every turn regardless of the configured interval.
+                        let turn_count = session.messages.iter()
+                            .filter(|m| m.role == openfang_types::message::Role::User)
+                            .count();
+                        let should_run_smart = sm_interval == 0
+                            || turn_count % sm_interval.max(1) == 0;
+
+                        if should_run_smart {
+                        match kernel_clone.resolve_driver(&manifest) {
+                            Ok(agent_driver) => {
+                                let mem_clone = Arc::clone(&kernel_clone.memory);
+                                let emb_clone = kernel_clone.embedding_driver.clone();
+                                
+                                let memory_config = &kernel_clone.config.memory;
+                                
+                                let (fact_driver, fact_model) = kernel_clone
+                                    .resolve_memory_llm_driver(
+                                        &memory_config.fact_extraction_llm,
+                                        &manifest,
+                                        agent_driver.clone(),
+                                    )?;
+                                
+                                let (decision_driver, decision_model) = kernel_clone
+                                    .resolve_memory_llm_driver(
+                                        &memory_config.memory_decision_llm,
+                                        &manifest,
+                                        agent_driver,
+                                    )?;
+                                
+                                let has_assistant = session
+                                    .messages
+                                    .iter()
+                                    .any(|m| m.role == openfang_types::message::Role::Assistant);
+                                let new_msgs: Vec<_> = session.messages[messages_before..].to_vec();
+                                let agent_id_for_smart = agent_id;
+
+                                tokio::spawn(async move {
+                                    match openfang_memory::smart_memory::smart_add(
+                                        agent_id_for_smart,
+                                        &new_msgs,
+                                        &mem_clone,
+                                        fact_driver.as_ref(),
+                                        decision_driver.as_ref(),
+                                        emb_clone.as_deref(),
+                                        &fact_model,
+                                        &decision_model,
+                                        has_assistant,
+                                    )
+                                    .await
+                                    {
+                                        Ok(r) => info!(
+                                            agent_id = %agent_id_for_smart,
+                                            added = r.added,
+                                            updated = r.updated,
+                                            deleted = r.deleted,
+                                            facts = r.facts_extracted,
+                                            "Smart memory update complete"
+                                        ),
+                                        Err(e) => warn!(
+                                            agent_id = %agent_id_for_smart,
+                                            "Smart memory update failed: {e}"
+                                        ),
+                                    }
+                                });
+                            }
+                            Err(e) => warn!(
+                                agent_id = %agent_id,
+                                "Smart memory driver resolve failed: {e}"
+                            ),
+                        }
+                        } // end should_run_smart
+                    }
+
+                    // Emergent personality extraction — streaming path
+                    // Mirrors the same logic as execute_llm_agent (sync path).
+                    let personality_config = &kernel_clone.config.memory.personality;
+                    tracing::debug!(
+                        agent_id = %agent_id,
+                        extraction_interval = personality_config.extraction_interval,
+                        implicit_enabled = personality_config.implicit_detection_enabled,
+                        "Personality extraction check (streaming)"
+                    );
+                    if personality_config.extraction_interval > 0 || personality_config.implicit_detection_enabled {
+                        let agent_id_for_extraction = agent_id;
+                        let mem_for_extraction = Arc::clone(&kernel_clone.memory);
+                        let personality_cfg = personality_config.clone();
+                        let session_id = session.id;
+
+                        let extract_result = match kernel_clone.resolve_driver(&manifest) {
+                            Ok(agent_driver) => {
+                                kernel_clone.resolve_memory_llm_driver(
+                                    &kernel_clone.config.memory.personality.personality_llm,
+                                    &manifest,
+                                    agent_driver,
+                                )
+                            }
+                            Err(e) => Err(e),
+                        };
+
+                        if let Ok((personality_driver, personality_model)) = extract_result {
+                            let emb_for_personality = kernel_clone.embedding_driver.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = run_personality_extraction(
+                                    agent_id_for_extraction,
+                                    session_id,
+                                    &mem_for_extraction,
+                                    personality_driver,
+                                    &personality_model,
+                                    &personality_cfg,
+                                    emb_for_personality,
+                                ).await {
+                                    warn!(agent_id = %agent_id_for_extraction, "Personality extraction failed (streaming): {e}");
+                                }
+                            });
+                        } else if let Err(e) = extract_result {
+                            warn!(agent_id = %agent_id, "Personality LLM driver resolve failed (streaming): {e}");
+                        }
+                    }
 
                     // Post-loop compaction check: if session now exceeds token threshold,
                     // trigger compaction in background for the next call.
@@ -2541,6 +2854,7 @@ impl OpenFangKernel {
             ctx_window,
             Some(&self.process_manager),
             content_blocks,
+            self.config.memory.smart_memory_enabled,
         )
         .await
         .map_err(KernelError::OpenFang)?;
@@ -2581,6 +2895,123 @@ impl OpenFangKernel {
             cost_usd: cost,
             tool_calls: result.iterations.saturating_sub(1),
         });
+
+        // mem0-style smart memory update (non-blocking background task)
+        if self.config.memory.smart_memory_enabled {
+            // smart_memory_interval: 0 = every turn, N = every N turns
+            let sm_interval = self.config.memory.smart_memory_interval;
+            // Count only user messages — session.messages includes both user and
+            // assistant turns, so messages.len() is always even and % sm_interval
+            // would fire every turn regardless of the configured interval.
+            let turn_count = session.messages.iter()
+                .filter(|m| m.role == openfang_types::message::Role::User)
+                .count();
+            let should_run_smart = sm_interval == 0
+                || turn_count % sm_interval.max(1) == 0;
+
+            if should_run_smart {
+            match self.resolve_driver(&manifest) {
+                Ok(agent_driver) => {
+                    let mem_clone = Arc::clone(&self.memory);
+                    let emb_clone = self.embedding_driver.clone();
+                    
+                    let memory_config = &self.config.memory;
+                    
+                    let (fact_driver, fact_model) = self
+                        .resolve_memory_llm_driver(
+                            &memory_config.fact_extraction_llm,
+                            &manifest,
+                            agent_driver.clone(),
+                        )?;
+                    
+                    let (decision_driver, decision_model) = self
+                        .resolve_memory_llm_driver(
+                            &memory_config.memory_decision_llm,
+                            &manifest,
+                            agent_driver,
+                        )?;
+                    
+                    let has_assistant = session
+                        .messages
+                        .iter()
+                        .any(|m| m.role == openfang_types::message::Role::Assistant);
+                    let new_msgs: Vec<_> = session.messages[messages_before..].to_vec();
+
+                    tokio::spawn(async move {
+                        match openfang_memory::smart_memory::smart_add(
+                            agent_id,
+                            &new_msgs,
+                            &mem_clone,
+                            fact_driver.as_ref(),
+                            decision_driver.as_ref(),
+                            emb_clone.as_deref(),
+                            &fact_model,
+                            &decision_model,
+                            has_assistant,
+                        )
+                        .await
+                        {
+                            Ok(r) => info!(
+                                agent_id = %agent_id,
+                                added = r.added,
+                                updated = r.updated,
+                                deleted = r.deleted,
+                                facts = r.facts_extracted,
+                                "Smart memory update complete"
+                            ),
+                            Err(e) => warn!(agent_id = %agent_id, "Smart memory update failed: {e}"),
+                        }
+                    });
+                }
+                Err(e) => warn!(
+                    agent_id = %agent_id,
+                    "Smart memory driver resolve failed: {e}"
+                ),
+            }
+            } // end should_run_smart
+        }
+
+        // Emergent personality extraction — runs every turn via implicit LLM detection,
+        // or on periodic schedule. No keyword gate required.
+        let personality_config = &self.config.memory.personality;
+        if personality_config.extraction_interval > 0 || personality_config.implicit_detection_enabled {
+            let agent_id_for_extraction = agent_id;
+            let mem_for_extraction = Arc::clone(&self.memory);
+            let personality_cfg = personality_config.clone();
+            let session_id = entry.session_id;
+            let manifest = manifest.clone();
+
+            let extract_result = match self.resolve_driver(&manifest) {
+                Ok(agent_driver) => {
+                    let memory_config = &self.config.memory;
+                    self.resolve_memory_llm_driver(
+                        &memory_config.personality.personality_llm,
+                        &manifest,
+                        agent_driver,
+                    )
+                }
+                Err(e) => Err(e),
+            };
+
+            if let Ok((personality_driver, personality_model)) = extract_result {
+                let emb_for_personality = self.embedding_driver.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = run_personality_extraction(
+                        agent_id_for_extraction,
+                        session_id,
+                        &mem_for_extraction,
+                        personality_driver,
+                        &personality_model,
+                        &personality_cfg,
+                        emb_for_personality,
+                    ).await {
+                        warn!(agent_id = %agent_id_for_extraction, "Personality extraction failed: {e}");
+                    }
+                });
+            } else if let Err(e) = extract_result {
+                warn!(agent_id = %agent_id, "Personality LLM driver resolve failed: {e}");
+            }
+        }
 
         // Populate cost on the result based on usage_footer mode
         let mut result = result;
@@ -3107,7 +3538,12 @@ impl OpenFangKernel {
         }
 
         let driver = self.resolve_driver(&entry.manifest)?;
-        let model = entry.manifest.model.model.clone();
+        // Strip provider prefix agar model string valid untuk API
+        // contoh: "openrouter/moonshotai/kimi-k2.5" → "moonshotai/kimi-k2.5"
+        let model = strip_provider_prefix(
+            &entry.manifest.model.model,
+            &entry.manifest.model.provider,
+        );
 
         let result = compact_session(driver, &model, &session, &config)
             .await
@@ -4381,6 +4817,24 @@ impl OpenFangKernel {
 
                     // --- Auto-recovery for crashed agents ---
                     if status.state == AgentState::Crashed {
+                        // Skip recovery for Reactive agents — they don't need it.
+                        // Reactive agents only run when a user message arrives, so
+                        // "crashing" is meaningless for them. Attempting recovery
+                        // causes a set_state(Running) which then triggers the
+                        // heartbeat's unresponsive check again, creating a cycle.
+                        // More importantly, if the agent somehow ends up in a
+                        // Continuous background loop (e.g. via a Hand that was
+                        // misconfigured), skipping recovery prevents spurious
+                        // background API calls with 24K+ token session contexts.
+                        if let Some(entry) = kernel.registry.get(status.agent_id) {
+                            use openfang_types::agent::ScheduleMode;
+                            if matches!(entry.manifest.schedule, ScheduleMode::Reactive) {
+                                // Just reset state to Running silently — no recovery loop needed
+                                let _ = kernel.registry.set_state(status.agent_id, AgentState::Running);
+                                continue;
+                            }
+                        }
+
                         let failures = recovery_tracker.failure_count(status.agent_id);
 
                         if failures >= config.max_recovery_attempts {
@@ -4464,6 +4918,22 @@ impl OpenFangKernel {
 
                     // --- Unresponsive Running agent ---
                     if status.unresponsive && status.state == AgentState::Running {
+                        // Only mark background agents (Continuous/Periodic) as Crashed.
+                        // Reactive agents are idle by design when no user is chatting —
+                        // marking them Crashed and recovering them causes spurious
+                        // background API calls with the full session context.
+                        let is_background = if let Some(entry) = kernel.registry.get(status.agent_id) {
+                            use openfang_types::agent::ScheduleMode;
+                            matches!(entry.manifest.schedule, ScheduleMode::Continuous { .. } | ScheduleMode::Periodic { .. })
+                        } else {
+                            false
+                        };
+
+                        if !is_background {
+                            // Reactive agent idle — just leave it Running, no crash/recovery needed
+                            continue;
+                        }
+
                         // Mark as Crashed so next cycle triggers recovery
                         let _ = kernel
                             .registry
@@ -4765,6 +5235,46 @@ impl OpenFangKernel {
         }
 
         Ok(primary)
+    }
+
+    /// Resolve a memory LLM driver and model from config.
+    ///
+    /// If `config.provider` is set, creates a new driver using that provider.
+    /// Otherwise, falls back to the agent's own driver and model.
+    fn resolve_memory_llm_driver(
+        &self,
+        config: &openfang_types::config::MemoryLlmConfig,
+        manifest: &AgentManifest,
+        agent_driver: Arc<dyn LlmDriver>,
+    ) -> KernelResult<(Arc<dyn LlmDriver>, String)> {
+        if let Some(ref provider) = config.provider {
+            let api_key = config
+                .api_key_env
+                .as_ref()
+                .and_then(|env| self.resolve_credential(env));
+
+            let base_url = self.lookup_provider_url(provider);
+
+            let driver_config = DriverConfig {
+                provider: provider.clone(),
+                api_key,
+                base_url,
+                skip_permissions: true,
+            };
+
+            let driver = drivers::create_driver(&driver_config).map_err(|e| {
+                KernelError::BootFailed(format!("Memory LLM driver init failed: {e}"))
+            })?;
+
+            let model = config
+                .model
+                .clone()
+                .unwrap_or_else(|| manifest.model.model.clone());
+
+            Ok((driver, model))
+        } else {
+            Ok((agent_driver, manifest.model.model.clone()))
+        }
     }
 
     /// Connect to all configured MCP servers and cache their tool definitions.

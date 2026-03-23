@@ -16,7 +16,7 @@ use openfang_types::agent::{AgentEntry, AgentId, SessionId};
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{
     ConsolidationReport, Entity, ExportFormat, GraphMatch, GraphPattern, ImportReport, Memory,
-    MemoryFilter, MemoryFragment, MemoryId, MemorySource, Relation,
+    MemoryFilter, MemoryFragment, MemoryId, MemorySource, PersonalityCategory, Relation,
 };
 use rusqlite::Connection;
 use std::collections::HashMap;
@@ -346,9 +346,11 @@ impl MemorySubstrate {
         scope: &str,
         metadata: HashMap<String, serde_json::Value>,
         embedding: Option<&[f32]>,
+        locked: bool,
+        personality_category: Option<&str>,
     ) -> OpenFangResult<MemoryId> {
         self.semantic
-            .remember_with_embedding(agent_id, content, source, scope, metadata, embedding)
+            .remember_with_embedding(agent_id, content, source, scope, metadata, embedding, locked, personality_category)
     }
 
     /// Recall memories using vector similarity when a query embedding is provided.
@@ -395,11 +397,14 @@ impl MemorySubstrate {
         scope: &str,
         metadata: HashMap<String, serde_json::Value>,
         embedding: Option<&[f32]>,
+        locked: bool,
+        personality_category: Option<&str>,
     ) -> OpenFangResult<MemoryId> {
         let store = self.semantic.clone();
         let content = content.to_string();
         let scope = scope.to_string();
         let embedding_owned = embedding.map(|e| e.to_vec());
+        let personality_cat = personality_category.map(|s| s.to_string());
         tokio::task::spawn_blocking(move || {
             store.remember_with_embedding(
                 agent_id,
@@ -408,10 +413,306 @@ impl MemorySubstrate {
                 &scope,
                 metadata,
                 embedding_owned.as_deref(),
+                locked,
+                personality_cat.as_deref(),
             )
         })
         .await
         .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    pub fn update_memory_content(&self, id: MemoryId, new_content: &str) -> OpenFangResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let rows = conn
+            .execute(
+                "UPDATE memories SET content = ?1, updated_at = ?2 WHERE id = ?3 AND deleted = 0",
+                rusqlite::params![
+                    new_content,
+                    chrono::Utc::now().to_rfc3339(),
+                    id.0.to_string(),
+                ],
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        if rows == 0 {
+            return Err(OpenFangError::Memory(format!(
+                "Memory not found or already deleted: {}",
+                id.0
+            )));
+        }
+        Ok(())
+    }
+
+    /// Append a row to the `memory_history` audit table.
+    ///
+    /// | event    | old_memory | new_memory |
+    /// |----------|------------|------------|
+    /// | `"ADD"`  | `None`     | `Some(…)`  |
+    /// | `"UPDATE"`| `Some(…)` | `Some(…)`  |
+    /// | `"DELETE"`| `Some(…)` | `None`     |
+    ///
+    /// Failures are non-fatal — callers log and continue.
+    pub fn add_memory_history(
+        &self,
+        memory_id: &str,
+        old_memory: Option<&str>,
+        new_memory: Option<&str>,
+        event: &str,
+    ) -> OpenFangResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO memory_history (id, memory_id, old_memory, new_memory, event, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![id, memory_id, old_memory, new_memory, event, now],
+        )
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        Ok(())
+    }
+
+
+    // -----------------------------------------------------------------
+    // Personality memory operations — isolated table, never touched by
+    // smart memory consolidation pipeline.
+    // -----------------------------------------------------------------
+
+    /// A single personality memory record from the dedicated table.
+    /// Returned by recall_personality_memories().
+    pub fn save_personality_memory(
+        &self,
+        agent_id: AgentId,
+        content: &str,
+        category: &str,
+        locked: bool,
+        extraction_trigger: &str,
+        metadata: &serde_json::Value,
+    ) -> OpenFangResult<MemoryId> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let id = uuid::Uuid::new_v4();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO personality_memories
+             (id, agent_id, content, category, locked, extraction_trigger, metadata, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+            rusqlite::params![
+                id.to_string(),
+                agent_id.0.to_string(),
+                content,
+                category,
+                locked as i32,
+                extraction_trigger,
+                metadata.to_string(),
+                now,
+            ],
+        )
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        Ok(MemoryId(id))
+    }
+
+    /// Async wrapper for save_personality_memory.
+    pub async fn save_personality_memory_async(
+        &self,
+        agent_id: AgentId,
+        content: &str,
+        category: &str,
+        locked: bool,
+        extraction_trigger: &str,
+        metadata: serde_json::Value,
+        embedding: Option<Vec<f32>>,
+    ) -> OpenFangResult<MemoryId> {
+        let conn = Arc::clone(&self.conn);
+        let content = content.to_string();
+        let category = category.to_string();
+        let extraction_trigger = extraction_trigger.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().map_err(|e| OpenFangError::Internal(e.to_string()))?;
+            let id = uuid::Uuid::new_v4();
+            let now = chrono::Utc::now().to_rfc3339();
+
+            // Serialize embedding to bytes if provided
+            let embedding_blob: Option<Vec<u8>> = embedding.map(|v| {
+                v.iter().flat_map(|f| f.to_le_bytes()).collect()
+            });
+
+            conn.execute(
+                "INSERT INTO personality_memories
+                 (id, agent_id, content, category, locked, extraction_trigger, metadata, embedding, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+                rusqlite::params![
+                    id.to_string(),
+                    agent_id.0.to_string(),
+                    content,
+                    category,
+                    locked as i32,
+                    extraction_trigger,
+                    metadata.to_string(),
+                    embedding_blob,
+                    now,
+                ],
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            Ok(MemoryId(id))
+        })
+        .await
+        .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Recall personality memories for an agent, optionally filtered by category.
+    /// Returns only non-deleted records, ordered by created_at DESC.
+    pub fn recall_personality_memories(
+        &self,
+        agent_id: AgentId,
+        category: Option<&str>,
+        limit: usize,
+    ) -> OpenFangResult<Vec<PersonalityMemoryRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+
+        let (sql, params_vec): (String, Vec<String>) = match category {
+            Some(cat) => (
+                "SELECT id, content, category, locked, extraction_trigger, metadata, created_at
+                 FROM personality_memories
+                 WHERE agent_id = ?1 AND category = ?2 AND deleted = 0
+                 ORDER BY created_at DESC
+                 LIMIT ?3"
+                    .to_string(),
+                vec![
+                    agent_id.0.to_string(),
+                    cat.to_string(),
+                    limit.to_string(),
+                ],
+            ),
+            None => (
+                "SELECT id, content, category, locked, extraction_trigger, metadata, created_at
+                 FROM personality_memories
+                 WHERE agent_id = ?1 AND deleted = 0
+                 ORDER BY created_at DESC
+                 LIMIT ?2"
+                    .to_string(),
+                vec![agent_id.0.to_string(), limit.to_string()],
+            ),
+        };
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        let rows = if params_vec.len() == 3 {
+            stmt.query_map(
+                rusqlite::params![&params_vec[0], &params_vec[1], params_vec[2].parse::<i64>().unwrap_or(50)],
+                map_personality_row,
+            )
+        } else {
+            stmt.query_map(
+                rusqlite::params![&params_vec[0], params_vec[1].parse::<i64>().unwrap_or(50)],
+                map_personality_row,
+            )
+        }
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        rows.filter_map(|r| r.ok())
+            .collect::<Vec<_>>()
+            .pipe_ok()
+    }
+
+    /// Update the content of an existing personality memory.
+    /// Only non-locked memories can be updated.
+    /// Returns Ok(true) if updated, Ok(false) if locked or not found.
+    pub fn update_personality_memory(
+        &self,
+        id: &str,
+        new_content: &str,
+    ) -> OpenFangResult<bool> {
+        self.update_personality_memory_with_embedding(id, new_content, None)
+    }
+
+    /// Update content and optionally re-embed a personality memory.
+    /// Only non-locked memories can be updated.
+    pub fn update_personality_memory_with_embedding(
+        &self,
+        id: &str,
+        new_content: &str,
+        embedding: Option<Vec<f32>>,
+    ) -> OpenFangResult<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let locked: i32 = conn
+            .query_row(
+                "SELECT locked FROM personality_memories WHERE id = ?1 AND deleted = 0",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if locked != 0 {
+            return Ok(false);
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        match embedding {
+            Some(v) => {
+                let blob: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+                conn.execute(
+                    "UPDATE personality_memories SET content = ?1, embedding = ?2, updated_at = ?3 WHERE id = ?4",
+                    rusqlite::params![new_content, blob, now, id],
+                )
+            }
+            None => {
+                conn.execute(
+                    "UPDATE personality_memories SET content = ?1, updated_at = ?2 WHERE id = ?3",
+                    rusqlite::params![new_content, now, id],
+                )
+            }
+        }
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        Ok(true)
+    }
+
+    /// Soft-delete a personality memory by ID.
+    /// Locked memories cannot be deleted — returns Ok(false) if locked.
+    pub fn delete_personality_memory(
+        &self,
+        id: &str,
+    ) -> OpenFangResult<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+
+        // Check locked status first
+        let locked: i32 = conn
+            .query_row(
+                "SELECT locked FROM personality_memories WHERE id = ?1 AND deleted = 0",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        if locked != 0 {
+            return Ok(false); // locked, cannot delete
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE personality_memories SET deleted = 1, updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![now, id],
+        )
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        Ok(true)
     }
 
     // -----------------------------------------------------------------
@@ -677,6 +978,56 @@ impl Memory for MemorySubstrate {
             memories_imported: 0,
             errors: vec!["Import not yet implemented in Phase 1".to_string()],
         })
+    }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Personality memory types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A single record from the `personality_memories` table.
+#[derive(Debug, Clone)]
+pub struct PersonalityMemoryRecord {
+    pub id: String,
+    pub content: String,
+    pub category: PersonalityCategory,
+    pub locked: bool,
+    pub extraction_trigger: String,
+    pub metadata: serde_json::Value,
+    pub created_at: String,
+}
+
+fn map_personality_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PersonalityMemoryRecord> {
+    let category_str: String = row.get(2)?;
+    let category = match category_str.as_str() {
+        "self" => PersonalityCategory::Self_,
+        "relationship" => PersonalityCategory::Relationship,
+        "user_preference" => PersonalityCategory::UserPreference,
+        _ => PersonalityCategory::Self_,
+    };
+    let metadata_str: String = row.get(5)?;
+    let metadata = serde_json::from_str(&metadata_str).unwrap_or(serde_json::json!({}));
+    Ok(PersonalityMemoryRecord {
+        id: row.get(0)?,
+        content: row.get(1)?,
+        category,
+        locked: row.get::<_, i32>(3)? != 0,
+        extraction_trigger: row.get(4)?,
+        metadata,
+        created_at: row.get(6)?,
+    })
+}
+
+trait PipeOk<T> {
+    fn pipe_ok(self) -> OpenFangResult<T>;
+}
+
+impl<T> PipeOk<Vec<T>> for Vec<T> {
+    fn pipe_ok(self) -> OpenFangResult<Vec<T>> {
+        Ok(self)
     }
 }
 

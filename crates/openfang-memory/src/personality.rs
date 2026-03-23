@@ -326,18 +326,42 @@ fn parse_personality_actions(
         match event {
             "ADD" => {
                 if !text_val.is_empty() {
+                    // Try to find the original extracted fact by matching text content.
+                    // Consolidation LLM sometimes rewrites the text, so we do a fuzzy
+                    // match: if no exact match, try the closest category by checking if
+                    // the text starts with "I " (self) vs "User " (user_preference) vs
+                    // dynamic language (relationship). This avoids falling back to
+                    // new_facts.first() which assigns the wrong category.
                     let matching_fact = new_facts.iter()
                         .find(|f| f.content.trim() == text_val.trim())
-                        .cloned()
-                        .or_else(|| new_facts.first().cloned());
+                        .cloned();
 
-                    if let Some(fact) = matching_fact {
-                        actions.push(PersonalityAction::Add {
-                            text: text_val,
-                            category: fact.category,
-                            locked: fact.locked,
-                        });
-                    }
+                    let (category, locked) = if let Some(ref fact) = matching_fact {
+                        // Exact match found — use its category
+                        (fact.category.clone(), fact.locked)
+                    } else {
+                        // No exact match — infer category from text content directly
+                        // using the same guardrail logic as parse_unified_personality_json
+                        if text_val.starts_with("I ") || text_val.starts_with("I'") {
+                            (PersonalityCategory::Self_, true)
+                        } else if text_val.starts_with("User ") || text_val.starts_with("User'") {
+                            (PersonalityCategory::UserPreference, false)
+                        } else if text_val.starts_with("The ")
+                            || text_val.starts_with("Dynamic")
+                            || text_val.starts_with("Relationship")
+                        {
+                            (PersonalityCategory::Relationship, false)
+                        } else {
+                            // Ambiguous — default to user_preference (safer than self)
+                            (PersonalityCategory::UserPreference, false)
+                        }
+                    };
+
+                    actions.push(PersonalityAction::Add {
+                        text: text_val,
+                        category,
+                        locked,
+                    });
                 }
             }
             "UPDATE" => {

@@ -140,8 +140,29 @@ fn parse_unified_personality_json(text: &str) -> OpenFangResult<Vec<ExtractedPer
         };
         let category_str = obs.get("category").and_then(|v| v.as_str()).unwrap_or("self");
 
+        // Hard guardrail: if LLM assigns "self" but content does not start with "I "
+        // (i.e. describes user behavior or interaction dynamic instead of AI behavior),
+        // auto-correct to the appropriate category rather than silently storing it wrong.
+        // This is a code-level enforcement — the prompt already instructs correctly but
+        // LLMs occasionally slip on emotional or nuanced conversations.
         let (category, locked) = match category_str {
-            "self" => (PersonalityCategory::Self_, true),
+            "self" if content.starts_with("I ") || content.starts_with("I'") => {
+                (PersonalityCategory::Self_, true)
+            }
+            "self" if content.starts_with("User ") || content.starts_with("User'") => {
+                // Clearly about the user — redirect to user_preference
+                (PersonalityCategory::UserPreference, false)
+            }
+            "self" if content.starts_with("The ") || content.starts_with("Dynamic")
+                || content.starts_with("Relationship") =>
+            {
+                // Describes interaction dynamic — redirect to relationship
+                (PersonalityCategory::Relationship, false)
+            }
+            "self" => {
+                // Ambiguous — default to user_preference (safer than self)
+                (PersonalityCategory::UserPreference, false)
+            }
             "relationship" => (PersonalityCategory::Relationship, false),
             "user_preference" => (PersonalityCategory::UserPreference, false),
             _ => continue,

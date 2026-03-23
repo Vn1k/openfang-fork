@@ -2237,7 +2237,12 @@ impl OpenFangKernel {
                     if kernel_clone.config.memory.smart_memory_enabled {
                         // smart_memory_interval: 0 = every turn, N = every N turns
                         let sm_interval = kernel_clone.config.memory.smart_memory_interval;
-                        let turn_count = session.messages.len();
+                        // Count only user messages — session.messages includes both user and
+                        // assistant turns, so messages.len() is always even and % sm_interval
+                        // would fire every turn regardless of the configured interval.
+                        let turn_count = session.messages.iter()
+                            .filter(|m| m.role == openfang_types::message::Role::User)
+                            .count();
                         let should_run_smart = sm_interval == 0
                             || turn_count % sm_interval.max(1) == 0;
 
@@ -2895,7 +2900,12 @@ impl OpenFangKernel {
         if self.config.memory.smart_memory_enabled {
             // smart_memory_interval: 0 = every turn, N = every N turns
             let sm_interval = self.config.memory.smart_memory_interval;
-            let turn_count = session.messages.len();
+            // Count only user messages — session.messages includes both user and
+            // assistant turns, so messages.len() is always even and % sm_interval
+            // would fire every turn regardless of the configured interval.
+            let turn_count = session.messages.iter()
+                .filter(|m| m.role == openfang_types::message::Role::User)
+                .count();
             let should_run_smart = sm_interval == 0
                 || turn_count % sm_interval.max(1) == 0;
 

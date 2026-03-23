@@ -82,11 +82,24 @@ pub async fn extract_facts(
     // Build plain-text conversation block (mirrors mem0's parse_messages).
     // System messages are intentionally skipped — they must not influence
     // fact extraction per mem0's USER_MEMORY_EXTRACTION_PROMPT rules.
+    //
+    // For user memory extraction (is_agent_memory = false), assistant messages
+    // are also excluded at the code level. The prompt already instructs the LLM
+    // to ignore assistant turns, but filtering here is more reliable — some
+    // models (including gpt-4o-mini) occasionally extract facts from AI
+    // responses that happen to describe user preferences or intent.
     let mut conversation_text = String::new();
     for msg in messages {
         let label = match msg.role {
             Role::User => "User",
-            Role::Assistant => "Assistant",
+            Role::Assistant => {
+                // Only include assistant messages when extracting agent memory.
+                // For user memory, skip entirely to prevent cross-contamination.
+                if !is_agent_memory {
+                    continue;
+                }
+                "Assistant"
+            }
             Role::System => continue,
         };
         let content = msg.content.text_content();

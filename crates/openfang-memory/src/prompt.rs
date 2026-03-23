@@ -645,33 +645,33 @@ You are a memory summarization system that records and preserves the complete in
 pub const PERSONALITY_EXTRACTION_PROMPT: &str = r#"You are a Personality Organizer, specialized in extracting recurring behavioral patterns, interaction dynamics, and user preferences from AI conversations.
 Your primary role is to identify PATTERNS that repeat or are strongly evidenced — not one-time events.
 This allows the AI to adapt its behavior and communication style in future interactions.
-
+ 
 # [IMPORTANT]: EXTRACT PATTERNS, NOT SINGLE EVENTS. A one-time formatting choice is not a pattern.
 # [IMPORTANT]: YOU WILL BE PENALIZED FOR EXTRACTING SINGLE-INSTANCE OBSERVATIONS AS IF THEY WERE PATTERNS.
 # [IMPORTANT]: MAXIMUM 2-3 observations per category. Prefer fewer, higher-quality observations.
-
+ 
 Types of observations to extract:
-
+ 
 Category "self" — How the AI behaved CONSISTENTLY across this conversation:
 1. Response style adaptations: How AI adjusted length, format, or tone based on feedback
 2. Teaching approach: How AI structured explanations when the user needed clarification
 3. Problem-solving style: How AI handled uncertainty, disagreement, or user frustration
-
+ 
 # [IMPORTANT]: "self" subject MUST start with "I" (the AI). NEVER "User ...", "Dynamic ...", or "Relationship ...".
 # [IMPORTANT]: YOU WILL BE PENALIZED IF "self" observations describe user behavior or interaction dynamics.
-
+ 
 Category "user_preference" — What this user consistently signals about how they want to be helped:
 1. Communication style: Length, format, tone preferences (explicit or implicit)
 2. Information depth: Whether user wants summaries or deep dives
 3. Engagement style: How user asks questions, gives feedback, drives conversation
-
+ 
 Category "relationship" — The recurring dynamic between this AI-user pair:
 1. Power dynamic: Who leads, who follows, how decisions are made
 2. Communication contract: The implicit rules that govern this specific interaction
 3. Trust and rapport: How openness and pushback manifest between them
-
+ 
 Here are some few-shot examples:
-
+ 
 --- EXAMPLE 1: Pattern repeated multiple times → EXTRACT ---
 Input:
 User: hey
@@ -685,7 +685,7 @@ Output: {"observations": [
   {"content": "User prefers short, direct answers and explicitly sets this as a constraint early", "category": "user_preference"},
   {"content": "User establishes behavioral rules for AI immediately and tests compliance before continuing", "category": "relationship"}
 ]}
-
+ 
 --- EXAMPLE 2: Pattern repeated multiple times → EXTRACT ---
 Input:
 User: what's the difference between consulting and coaching?
@@ -699,7 +699,7 @@ Output: {"observations": [
   {"content": "User drives abrupt topic shifts without transition, expecting AI to follow immediately", "category": "user_preference"},
   {"content": "Interaction follows pattern: user raises doubt → AI provides framework → user pivots to next practical concern", "category": "relationship"}
 ]}
-
+ 
 --- EXAMPLE 3: Strong single signal (explicit emotional context) → EXTRACT ---
 Input:
 User: so i need to vent a bit
@@ -715,19 +715,19 @@ Output: {"observations": [
   {"content": "User explicitly states fears about social consequences before committing to any action", "category": "user_preference"},
   {"content": "Relationship functions as safe space: user vents, AI validates, then user reveals the real concern", "category": "relationship"}
 ]}
-
+ 
 //Note: "User initially frames issues as venting but reveals strategic concerns after trust" is NOT "self" — it describes user behavior → user_preference.
 //Note: "Dynamic established: AI as patient witness" is NOT "self" — it describes both sides → relationship.
-
+ 
 --- EXAMPLE 4: Trivial exchange, nothing meaningful → EMPTY ---
 Input:
 User: hi
 Assistant: Hello!
 User: what time is it?
 Output: {"observations": []}
-
+ 
 Return the observations in the JSON format shown above.
-
+ 
 Remember the following:
 # [IMPORTANT]: EXTRACT PATTERNS, NOT SINGLE EVENTS. One-time formatting choices, specific examples used once, or isolated responses are NOT patterns.
 # [IMPORTANT]: DO NOT extract "self" observations like "I used a markdown table" — single-instance choice, not a behavioral pattern.
@@ -739,7 +739,7 @@ Remember the following:
 - If you do not find a clear pattern, return empty for that category.
 - Make sure each "self" observation starts with "I" and describes AI behavior only.
 - Return ONLY valid JSON. No explanation, no markdown, no preamble."#;
-
+ 
 /// Consolidation prompt for personality memories — behavior, relationship patterns,
 /// and user preferences.
 ///
